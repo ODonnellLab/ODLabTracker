@@ -154,7 +154,7 @@ def float_to8bit(frame):
         
         # Scale to 0-255 and convert to uint8
         frame = np.round(frame * 255).astype(np.uint8)
-        # print(np.max(frame), np.min(frame))
+        print(np.max(frame), np.min(frame))
     return(frame)
 
 def subtract_background(frame,
@@ -376,7 +376,6 @@ def collect_detections(stack, global_thresh, min_area, max_area, illumination=0)
                                           illumination=illumination)
         for prop in props:
             if prop.area_convex < min_area or prop.area_convex > max_area:
-                print(f"area: {prop.area_convex} object outside area range")
                 prop = None
             else:
                 y, x = prop.centroid  # note (row, col) = (y, x)
