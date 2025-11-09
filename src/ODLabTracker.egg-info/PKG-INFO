@@ -22,6 +22,7 @@ Classifier: Programming Language :: Python :: 3.12
 Classifier: Programming Language :: Python :: 3 :: Only
 Requires-Python: >=3.8
 Description-Content-Type: text/markdown
+Requires-Dist: av
 Requires-Dist: numpy
 Requires-Dist: scipy
 Requires-Dist: pyampd

@@ -12,6 +12,7 @@ import tifffile
 from PIL import Image
 from skimage.color import rgb2gray
 import yaml
+import time
 
 # plotting
 import matplotlib  as mpl
@@ -58,7 +59,8 @@ else:
     root.destroy()
 
 result_path = os.path.join(f"{os.path.splitext(file_path)[0]}_results")
-print(f"results will be saved to {result_path}")   
+print(f"results will be saved to {result_path}")
+os.mkdir(result_path)
 
 if args.verbose:
     print("Verbose mode enabled.")
@@ -82,6 +84,7 @@ if args.config:
     min_length = config_data['min_length'] # minimum length of track in frames to keep
     frame_rate = config_data['frame_rate'] # FPS - only necessary for speed analysis
     illumination = config_data['illumination'] # illumination source, 0 = white worms on dark (e.g. IR), 1 = dark worms on light
+    subsample = config_data['subsample']
     
 else:
     #default values small plate on IR light:
@@ -109,6 +112,8 @@ if illumination == 0:
     print(f'analyzing light worms on dark background')
 else:
     print(f'analyzing dark worms on light background')
+if subsample > 1:
+    print(f"keeping one out of every {subsample} frames")
 
 print(f'selected image path: {file_path}')
 filename = os.path.splitext(file_path)[0]
@@ -119,74 +124,113 @@ print(f'selected filename: {filename}')
 import time
 
 start_time = time.time()
-im = iio.imread(file_path)
-end_time = time.time()
-print(f"Reading in {im.shape[0]} frames of video took {end_time - start_time} seconds")
-print(im.shape)
+first_frame = iio.imread(file_path, index = 0,  plugin = "pyav")
+imiter_vid = iio.imiter(file_path, plugin = "pyav")
+image_props = iio.improps(file_path, plugin="pyav")
+print(image_props)
+num_frames = image_props.shape[0]
 
-if im.shape[-1] == 3:
-    print("!!!Video is RGB, need to convert to grayscale 8-bit - consider \n changing video output to this type ahead of time!!!")
+if first_frame.shape[-1] == 3:
+    print("\n!!!Video is RGB, need to convert to grayscale 8-bit - consider changing video output to this type ahead of time!!!\n")
+
+frames = []
 
 ##### 3. tracking #######
-
-print(f'Running full tracking on {im.shape[0]} frames')
-
-# if that looks good, run for the whole video after converting to 8-bit grayscale
-frames = []
+if subsample > 1:
+    print(f'Running tracking on {num_frames/subsample} frames from the original {num_frames} frames')
+else:
+    print(f'Running full tracking on {num_frames} frames')
 
 # not sure why matmul errors happen for the first rgb2gray call but suppress this block:
 with np.errstate(invalid='ignore',divide='ignore',over='ignore'):
     start_time = time.time()
-    for i, frame in enumerate(im):
-        # Convert to grayscale only if RGB
-        if frame.ndim == 3 and frame.shape[-1] == 3: 
-            #print("converting to grayscale images")
-            frame = rgb2gray(frame)
-            frame = (frame * 255).astype(np.uint8)
-        elif frame.ndim == 2:  # already grayscale
-            #print("converting to 8-bit")
-            frame = frame.astype(np.uint8)
+    for i, frame in enumerate(imiter_vid):
+        if i % subsample == 0:
+            # print(f"keeping frame {i}")
+            print(f"\rKeeping frame: {i}", end="", flush=True)
+            time.sleep(0.001)
+            if frame.ndim == 3 and frame.shape[-1] == 3:
+                if i/subsample == 1:
+                    print("converting to grayscale images")
+                frame = rgb2gray(frame)
+                frame = (frame * 255).astype(np.uint8)
+            elif frame.ndim == 2:
+                if i/subsample == 1: 
+                    print("already grayscale, converting to 8-bit")
+                frame = frame.astype(np.uint8)
             # Append the processed frame to the list
-        frames.append(frame)
+            frames.append(frame)
     end_time = time.time()
-print(f"Converting {len(frames)} frames to 8-bit grayscale took {end_time - start_time} seconds")
+    print(f"  Reading in {len(frames)} frames from the full length video took {end_time - start_time} seconds")
 
-# now simple track for the whole video and link tracks together
+# now simple track for the whole video and link tracks together 
+# using new first frame after subsampling
 first_frame = frames[0]
+# # now simple track for the whole video and link tracks together
+print(f"Tracking and linking objects from {len(frames)} frames")
 
 # Compute global threshold
-_, _, global_thresh = tracking.preprocess_frame(first_frame, 
-                                                min_area, 
-                                                max_area, 
-                                                thresh,
-                                                illumination=illumination)
-
-# Collect detections
 if thresh is None:
-    detections = tracking.collect_detections(frames, 
-                                             global_thresh, 
-                                             min_area, 
-                                             max_area,
-                                            illumination-illumination)
-else:    
-    print("tracking full video using manual threshold")
-    detections = tracking.collect_detections(frames, 
-                                             thresh, 
-                                             min_area, 
-                                             max_area,
-                                             illumination=illumination)
+    _, _, global_thresh = tracking.preprocess_frame(first_frame, 
+                                                    min_area, 
+                                                    max_area, 
+                                                    thresh,
+                                                    illumination=illumination)
+else:
+    print("tracking video using manual threshold")
+    global_thresh = thresh
+    
+# Collect detections
+detections = tracking.collect_detections(frames, 
+                                        global_thresh = global_thresh, 
+                                        min_area=min_area, 
+                                        max_area=max_area,
+                                        illumination=illumination)
 
 # Link tracks
 # Suppress all trackpy logging messages
-tp.ignore_logging()
+# tp.ignore_logging()
 
-tracks = tracking.link_tracks(detections, search_range=search_range, memory=gap_range)
+tracks = tracking.link_tracks(detections, search_range=search_range, memory=gap_range, quiet = True)
+
+# filtering tracks whose object area changes more than some percentage%
+
+print("calculating speed")
+window_size = 2
+tracks['dx'] = tracks.groupby('particle')['x'].diff()
+tracks['dy'] = tracks.groupby('particle')['y'].diff()
+tracks['dt'] = tracks.groupby('particle')['frame'].diff()
+# Calculate instantaneous speed (distance / time) of the centroid (not ideal) This is per frame (not per sec)
+tracks['speed_int'] = np.sqrt(tracks['dx']**2 + tracks['dy']**2) 
+tracks['speed_roll'] = tracks.groupby('particle')['speed_int'].rolling(
+    window = window_size,
+    min_periods=1).mean().reset_index(level=0, drop=True)
+tracks['ecc_roll'] = tracks.groupby('particle')['eccentricity'].rolling(
+    window = window_size,
+    min_periods=1).mean().reset_index(level=0, drop=True)
+# calculate the area of a rectangle bound by the major and minor axes
+tracks['area_rect'] = tracks['major_axis'] * tracks['minor_axis']
+tracks['area_roll'] = tracks.groupby('particle')['area_rect'].rolling(
+    window = window_size,
+    min_periods=1).mean().reset_index(level=0, drop=True)
+tracks['angvel'] = tracks.groupby('particle')['orientation'].diff()
+# Handle angle wrapping (e.g., crossing the -pi to pi boundary)
+tracks['angvel'] = np.abs(np.arctan2(np.sin(tracks['angvel']), np.cos(tracks['angvel'])))
+tracks['angvel_roll'] = tracks.groupby('particle')['angvel'].rolling(
+    window = window_size,
+    min_periods=1).mean().reset_index(level=0, drop=True)
+
+# guess at when the animal is turning based on speed and eccentricity
+# print(np.nanmax(tracks['speed']))
+# print(np.nanpercentile(tracks['speed'], 75))
+# print(np.nanpercentile(tracks['speed'], 25))
 
 # Now tracks['particle'] is a persistent worm ID
 
 # visualize the track length of each "worm"
 # if there are background particles, this will lead to a ton of short tracks
 
+#### summarize some features after filtering ##### 
 counts = tracks.groupby("particle")["frame"].count()
 print('Mean track length is ',np.ceil(np.mean(counts)/2), ' frames')
 print('Minimum track length is ',int(min(counts)))
@@ -203,6 +247,9 @@ plt.show()
 # Remove short tracks
 print(f'removing tracks shorter than {min_length} frames')
 tracks = tracking.filter_short_tracks(tracks, min_length=min_length)
+
+# # filtering tracks whose object area changes more than 10%
+# tracks = tracking.filter_area_change(tracks, max_area_cv = 0.2)
 
 # Plot over first frame
 print('plotting linked and filtered worm tracks')

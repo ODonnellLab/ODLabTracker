@@ -6,3 +6,4 @@ search_range: 60 # max pixel distance to link tracks across frames
 min_length: 25 # minimum length of track in frames to keep
 frame_rate: 10 # FPS - necessary for speed analysis and video writing
 illumination: 0 # illumination source, 0 = white worms on dark (e.g. IR), 1 = dark worms on light. default 0
+subsample: 1 # frames to keep (1/n frames), will speed up analysis of videos with a high frame rate if using centroid tracking

@@ -5,6 +5,7 @@ description = "Fast and easy worm tracker"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
+    "av",
     "numpy",
     "scipy",
     "pyampd",

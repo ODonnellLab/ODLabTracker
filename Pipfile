@@ -19,11 +19,11 @@ imagecodecs = "*"
 torch = "*"
 torchvision = "*"
 tensorflow = "*"
-imageio = "*"
 imageio-ffmpeg = "*"
 jupyterlab = "*"
 ipyfilechooser = "*"
 opencv-python = "*"
+odlabtracker = {file = ".", editable = true}
 
 [dev-packages]
 
