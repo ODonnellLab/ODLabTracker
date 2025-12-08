@@ -37,6 +37,7 @@ Requires-Dist: ipykernel
 Requires-Dist: jupyterlab
 Requires-Dist: imagecodecs
 Requires-Dist: ipyfilechooser
+Requires-Dist: readlif
 Requires-Dist: torch
 Requires-Dist: torchvision
 Requires-Dist: tensorflow

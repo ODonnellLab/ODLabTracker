@@ -376,22 +376,32 @@ def collect_detections(stack, global_thresh, min_area, max_area, illumination=0)
                                           illumination=illumination)
         for prop in props:
             if prop.area_convex < min_area or prop.area_convex > max_area:
-                print(f"area: {prop.area_convex} object outside area range")
-                prop = None
-            else:
-                y, x = prop.centroid  # note (row, col) = (y, x)
-                records.append({
-                    "frame": frame_no,
-                    "x": x,
-                    "y": y,
-                    "area": prop.area,
-                    "major_axis": prop.axis_major_length,
-                    "minor_axis": prop.axis_minor_length,
-                    "orientation": prop.orientation,
-                    "eccentricity": prop.eccentricity,
-                    "euler_num": prop.euler_number,
-                    "solidity": prop.solidity,
-                    "area_convex": prop.area_convex
+                print(f"outside size range, size: {prop.area_convex}", end="", flush=True)
+                continue
+            
+            y, x = prop.centroid  # note (row, col) = (y, x)
+            # intensity properties (requires the original grayscale image)
+            intensity_image = frame
+            mask_obj = prop.image
+            pixel_vals = intensity_image[prop.slice][mask_obj]
+
+            records.append({
+                "frame": frame_no,
+                "x": x,
+                "y": y,
+                "area": prop.area,
+                "major_axis": prop.axis_major_length,
+                "minor_axis": prop.axis_minor_length,
+                "orientation": prop.orientation,
+                "eccentricity": prop.eccentricity,
+                "euler_num": prop.euler_number,
+                "solidity": prop.solidity,
+                "area_convex": prop.area_convex,
+                # fluorescence metrics
+                "mean_intensity": np.mean(pixel_vals),
+                "median_intensity": np.median(pixel_vals),
+                "max_intensity": np.max(pixel_vals),
+                "integrated_intensity": np.sum(pixel_vals)
                 })
     return pd.DataFrame(records)
 

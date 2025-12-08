@@ -151,7 +151,7 @@ with np.errstate(invalid='ignore',divide='ignore',over='ignore'):
             time.sleep(0.001)
             if frame.ndim == 3 and frame.shape[-1] == 3:
                 if i/subsample == 1:
-                    print("converting to grayscale images")
+                    print(" converting to grayscale images")
                 frame = rgb2gray(frame)
                 frame = (frame * 255).astype(np.uint8)
             elif frame.ndim == 2:

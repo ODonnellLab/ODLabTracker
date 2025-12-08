@@ -20,6 +20,7 @@ dependencies = [
     "jupyterlab",
     "imagecodecs",
     "ipyfilechooser",
+    "readlif",
     "torch",
     "torchvision",
     "tensorflow",
