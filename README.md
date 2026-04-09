@@ -9,11 +9,74 @@ A Python tool for tracking *C. elegans* behavior from video. Supports two analys
 
 ## Installation
 
-```bash
+### macOS / Linux
+
+1. Clone the repository:
+
+   ```bash
+   git clone https://github.com/ODonnellLab/ODLabTracker.git
+   cd ODLabTracker
+   ```
+
+2. Install in editable mode:
+
+   ```bash
+   pip install -e .
+   ```
+
+Requires Python 3.9+.
+
+---
+
+### Windows
+
+The `av` (PyAV) package requires FFmpeg binaries that are not bundled in the standard pip wheel on Windows. The most reliable approach is to use [Miniconda](https://docs.anaconda.com/miniconda/) and install `av` via conda-forge before running pip.
+
+**Step 1 — Install Miniconda**
+
+Download and run the Miniconda installer for Windows from:
+https://docs.anaconda.com/miniconda/
+
+During installation, check "Add Miniconda3 to my PATH" (or use the **Anaconda Prompt** that is added to the Start menu).
+
+**Step 2 — Clone the repository**
+
+Install [Git for Windows](https://git-scm.com/download/win) if you don't have it, then in an Anaconda Prompt or PowerShell:
+
+```
+git clone https://github.com/ODonnellLab/ODLabTracker.git
+cd ODLabTracker
+```
+
+**Step 3 — Create a conda environment**
+
+```
+conda create -n odlabtracker python=3.11
+conda activate odlabtracker
+```
+
+**Step 4 — Install `av` via conda-forge**
+
+```
+conda install av -c conda-forge
+```
+
+**Step 5 — Install remaining dependencies**
+
+```
 pip install -e .
 ```
 
-Requires Python 3.9+. Key dependencies: `trackpy`, `scikit-image`, `opencv-python`, `imageio[ffmpeg]`, `pyampd`, `tifffile`.
+**Step 6 — Run the tracker**
+
+Always activate the environment first in any new terminal session:
+
+```
+conda activate odlabtracker
+python track.py -c configs\your_config.yaml -f path\to\video.avi
+```
+
+> **Note:** Use backslashes (`\`) for file paths on Windows, or wrap paths in quotes if they contain spaces.
 
 ---
 
