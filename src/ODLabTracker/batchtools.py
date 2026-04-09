@@ -101,12 +101,15 @@ def FastTrackIter(file_path,config_data):
     print(f"Tracking and linking objects from {len(frames)} frames")
 
     # Compute global threshold
+    max_objects = config_data.get('max_objects', None)
+
     if thresh is None:
-        _, _, global_thresh = tracking.preprocess_frame(first_frame, 
-                                                        min_area, 
-                                                        max_area, 
+        _, _, global_thresh = tracking.preprocess_frame(first_frame,
+                                                        min_area,
+                                                        max_area,
                                                         thresh,
-                                                        illumination=illumination)
+                                                        illumination=illumination,
+                                                        max_objects=max_objects)
     else:
         print("tracking video using manual threshold")
         global_thresh = thresh

@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# importing, data handling
 import numpy as np
 import pandas as pd
 import ipyfilechooser
@@ -14,247 +13,272 @@ from skimage.color import rgb2gray
 import yaml
 import time
 
-# plotting
-import matplotlib  as mpl
+import matplotlib as mpl
 import cv2
 import matplotlib.pyplot as plt
 
-# thresholding
 from skimage import io, color, filters, morphology, measure
 from skimage.draw import rectangle_perimeter
 
-# tracking
 import trackpy as tp
-
-#from IPython.display import Video, Markdown, display
+from scipy.ndimage import median_filter
 
 import ODLabTracker
 from ODLabTracker import tracking
 
-####### 1. Setup #############
 import sys
 import argparse
 
-## Using argparse (more robust for complex arguments)
-parser = argparse.ArgumentParser(description="Process a file.")
-#parser.add_argument("-i", "--interactive", action="store_true", help="interactive file selection")
-parser.add_argument("-f", "--filename", help="The path to the input file, if specified")
-parser.add_argument("-c", "--config", help="Configuration (yaml) file, if specfified")
-parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output.")
-args = parser.parse_args()
 
-if args.filename:
-    print("batch mode")
-    print(f"Processing file: {os.path.join(os.getcwd(),args.filename)}")
-    file_path = os.path.join(os.getcwd(),args.filename)
-else:
-    import tkinter as tk
-    from tkinter import filedialog
-    
-    root = tk.Tk()
-    root.withdraw()
-    
-    file_path = filedialog.askopenfilename(title="Select a Video File")
-    
-    root.destroy()
+class Colors:
+    """ANSI color codes"""
+    RED    = '\033[91m'
+    GREEN  = '\033[92m'
+    BLUE   = '\033[94m'
+    WARNING = '\033[93m'
+    PURPLE = '\033[0;35m'
+    ENDC   = '\033[0m'
 
-result_path = os.path.join(f"{os.path.splitext(file_path)[0]}_results")
-print(f"results will be saved to {result_path}")
-os.mkdir(result_path)
 
-if args.verbose:
-    print("Verbose mode enabled.")
+def main(file_path, config_path, verbose=False):
 
-#### config file setup ####
-if args.config:
-    config_path = os.path.join(os.getcwd(),args.config)
-    import yaml
+    result_path = os.path.join(f"{os.path.splitext(file_path)[0]}_results")
+    print(f"results will be saved to {result_path}")
+    os.makedirs(result_path, exist_ok=True)
 
+    if verbose:
+        print("Verbose mode enabled.")
+
+    ####### 2. Config file setup ########
     with open(config_path, 'r') as f:
         config_data = yaml.safe_load(f)
-    
-    min_area = config_data['min_area'] #min area of worm in pixels
-    max_area = config_data['max_area'] #max area of worm in pixels
-    gap_range = config_data['gap_range'] # max number of frame gap to link worms
-    if config_data['thresh'] == 'None':
-        thresh = None
+
+    min_area      = config_data['min_area']
+    max_area      = config_data['max_area']
+    gap_range     = config_data['gap_range']
+    thresh        = None if config_data['thresh'] == 'None' else config_data['thresh']
+    thresh_method = config_data.get('thresh_method', 'otsu')
+    search_range  = config_data['search_range']
+    min_length    = config_data['min_length']
+    frame_rate    = config_data['frame_rate']
+    illumination  = config_data['illumination']
+    subsample     = config_data['subsample']
+    backsub       = config_data['backsub']
+    backsub_frames = config_data['backsub_frames']
+    pixel_length  = config_data['pixel_length']
+    speed_threshold = config_data['speed_threshold']
+    window_size   = config_data['window_size']
+    direction_threshold = config_data['direction_threshold']
+    min_run_length = config_data['min_run_length']
+    smooth_positions = config_data['smooth_positions']
+    smooth_window = config_data['smooth_window']
+    min_displacement_for_angle = config_data['min_displacement_for_angle']
+    reversal_persistence = config_data['reversal_persistence']
+    pirouette_speed_threshold = config_data['pirouette_speed_threshold']
+    pirouette_eccentricity_threshold = config_data['pirouette_eccentricity_threshold']
+    min_pirouette_duration = config_data['min_pirouette_duration']
+    max_instantaneous_speed = config_data['max_instantaneous_speed']
+    stability_threshold = config_data['stability_threshold']
+    max_objects   = config_data.get('max_objects', None)
+
+    print(f'{Colors.PURPLE}PARAMETER SETTINGS:{Colors.ENDC}')
+    print(f'minimum area of worm in pixels: {Colors.GREEN}{min_area}{Colors.ENDC}')
+    print(f'maximum area of worm in pixels: {Colors.GREEN}{max_area}{Colors.ENDC}')
+    print(f'gap range of worms in frames: {Colors.GREEN}{gap_range}{Colors.ENDC}')
+    if backsub:
+        print(f'{Colors.GREEN}Subtracting background{Colors.ENDC}')
+    if thresh is None:
+        print(f'{Colors.GREEN}automatically calculating threshold{Colors.ENDC}')
     else:
-        thresh = config_data['thresh'] # manual threshold - use if too few worms detected or too many short tracks
-    search_range = config_data['search_range'] # max pixel distance to link tracks across frames
-    min_length = config_data['min_length'] # minimum length of track in frames to keep
-    frame_rate = config_data['frame_rate'] # FPS - only necessary for speed analysis
-    illumination = config_data['illumination'] # illumination source, 0 = white worms on dark (e.g. IR), 1 = dark worms on light
-    subsample = config_data['subsample']
-    
-else:
-    #default values small plate on IR light:
-    min_area = 200 #min area of worm in pixels
-    max_area = 2000 #max area of worm in pixels
-    gap_range = 8 # max number of frame gap to link worms
-    thresh = None # manual threshold - use if too few worms detected or too many short tracks
-    search_range = 60 # max pixel distance to link tracks across frames
-    min_length = 25 # minimum length of track in frames to keep
-    frame_rate = 10 # FPS - only necessary for speed analysis
-    illumination = 0 # illumination source, 0 = white worms on dark (e.g. IR), 1 = dark worms on light
+        print(f'manual threshold: {Colors.GREEN}{thresh}{Colors.ENDC}')
+    print(f'maximum pixel distance to link worms: {Colors.GREEN}{search_range}{Colors.ENDC}')
+    print(f'minimum length of worm track to keep in frames: {Colors.GREEN}{min_length}{Colors.ENDC}')
+    print(f'frame rate to use for speed analysis: {Colors.GREEN}{frame_rate}{Colors.ENDC}')
+    if illumination == 0:
+        print(f'{Colors.GREEN}analyzing light worms on dark background{Colors.ENDC}')
+    else:
+        print(f'{Colors.GREEN}analyzing dark worms on light background{Colors.ENDC}')
+    if subsample > 1:
+        print(f"keeping one out of every {Colors.GREEN}{subsample}{Colors.ENDC} frames")
 
-print('PARAMETER SETTINGS:')
-print(f'minimum area of worm in pixels: {min_area}')
-print(f'maximum area of worm in pixels: {max_area}')
-print(f'gap range of worms in frames: {gap_range}')
-if thresh is None:
-    print(f'automatically calculating threshold')
-else:
-    print(f'manual threshold: {thresh}')
-print(f'maximum pixel distance to link worms: {search_range}')
-print(f'minimum length of worm track to keep in frames: {min_length}')
-print(f'frame rate to use for speed analysis: {frame_rate}')
-if illumination == 0:
-    print(f'analyzing light worms on dark background')
-else:
-    print(f'analyzing dark worms on light background')
-if subsample > 1:
-    print(f"keeping one out of every {subsample} frames")
+    print(f'selected image path: {file_path}')
+    filename = os.path.splitext(file_path)[0]
+    print(f'selected filename: {filename}')
 
-print(f'selected image path: {file_path}')
-filename = os.path.splitext(file_path)[0]
-print(f'selected filename: {filename}')
+    ####### 3. Load video ########
+    TIFF_EXTENSIONS = {".tif", ".tiff"}
+    file_ext  = os.path.splitext(file_path)[1].lower()
+    iio_plugin = "tifffile" if file_ext in TIFF_EXTENSIONS else "pyav"
+    print(f"Using imageio plugin: {iio_plugin}")
 
-
-###### 2. warnings for non-optimal video ######
-import time
-
-start_time = time.time()
-first_frame = iio.imread(file_path, index = 0,  plugin = "pyav")
-imiter_vid = iio.imiter(file_path, plugin = "pyav")
-image_props = iio.improps(file_path, plugin="pyav")
-print(image_props)
-num_frames = image_props.shape[0]
-
-if first_frame.shape[-1] == 3:
-    print("\n!!!Video is RGB, need to convert to grayscale 8-bit - consider changing video output to this type ahead of time!!!\n")
-
-frames = []
-
-##### 3. tracking #######
-if subsample > 1:
-    print(f'Running tracking on {num_frames/subsample} frames from the original {num_frames} frames')
-else:
-    print(f'Running full tracking on {num_frames} frames')
-
-# not sure why matmul errors happen for the first rgb2gray call but suppress this block:
-with np.errstate(invalid='ignore',divide='ignore',over='ignore'):
     start_time = time.time()
-    for i, frame in enumerate(imiter_vid):
-        if i % subsample == 0:
-            # print(f"keeping frame {i}")
-            print(f"\rKeeping frame: {i}", end="", flush=True)
-            time.sleep(0.001)
-            if frame.ndim == 3 and frame.shape[-1] == 3:
-                if i/subsample == 1:
-                    print(" converting to grayscale images")
-                frame = rgb2gray(frame)
-                frame = (frame * 255).astype(np.uint8)
-            elif frame.ndim == 2:
-                if i/subsample == 1: 
-                    print("already grayscale, converting to 8-bit")
-                frame = frame.astype(np.uint8)
-            # Append the processed frame to the list
-            frames.append(frame)
-    end_time = time.time()
-    print(f"  Reading in {len(frames)} frames from the full length video took {end_time - start_time} seconds")
+    if iio_plugin == "tifffile":
+        tif_file   = tifffile.TiffFile(file_path)
+        num_frames = len(tif_file.pages)
+        first_frame = tif_file.pages[0].asarray()
+        imiter_vid  = (page.asarray() for page in tif_file.pages)
+        print(f"TIFF stack: {num_frames} frames, shape {first_frame.shape}, dtype {first_frame.dtype}")
+    else:
+        first_frame = iio.imread(file_path, index=0, plugin=iio_plugin)
+        imiter_vid  = iio.imiter(file_path, plugin=iio_plugin)
+        image_props = iio.improps(file_path, plugin=iio_plugin)
+        print(image_props)
+        num_frames  = image_props.shape[0]
 
-# now simple track for the whole video and link tracks together 
-# using new first frame after subsampling
-first_frame = frames[0]
-# # now simple track for the whole video and link tracks together
-print(f"Tracking and linking objects from {len(frames)} frames")
+    if first_frame.ndim == 3 and first_frame.shape[-1] == 3:
+        print("\n!!!Video is RGB, need to convert to grayscale 8-bit - consider changing video output to this type ahead of time!!!\n")
 
-# Compute global threshold
-if thresh is None:
-    _, _, global_thresh = tracking.preprocess_frame(first_frame, 
-                                                    min_area, 
-                                                    max_area, 
-                                                    thresh,
-                                                    illumination=illumination)
-else:
-    print("tracking video using manual threshold")
-    global_thresh = thresh
-    
-# Collect detections
-detections = tracking.collect_detections(frames, 
-                                        global_thresh = global_thresh, 
-                                        min_area=min_area, 
-                                        max_area=max_area,
-                                        illumination=illumination)
+    frames = []
 
-# Link tracks
-# Suppress all trackpy logging messages
-# tp.ignore_logging()
+    if subsample > 1:
+        print(f'Running tracking on {num_frames/subsample} frames from the original {num_frames} frames')
+    else:
+        print(f'Running full tracking on {num_frames} frames')
 
-tracks = tracking.link_tracks(detections, search_range=search_range, memory=gap_range, quiet = True)
+    with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
+        start_time = time.time()
+        for i, frame in enumerate(imiter_vid):
+            if i % subsample == 0:
+                print(f"\rKeeping frame: {i}", end="", flush=True)
+                time.sleep(0.001)
+                if frame.ndim == 3 and frame.shape[-1] == 3:
+                    if i / subsample == 1:
+                        print(" converting to grayscale images")
+                    frame = rgb2gray(frame)
+                    frame = (frame * 255).astype(np.uint8)
+                elif frame.ndim == 2:
+                    if i / subsample == 1:
+                        print("already grayscale, converting to 8-bit")
+                    frame = frame.astype(np.uint8)
+                frames.append(frame)
+        end_time = time.time()
+        print(f"  Reading in {len(frames)} frames took {end_time - start_time:.1f} seconds")
 
-# filtering tracks whose object area changes more than some percentage%
+    first_frame = frames[0]
 
-print("calculating speed")
-window_size = 2
-tracks['dx'] = tracks.groupby('particle')['x'].diff()
-tracks['dy'] = tracks.groupby('particle')['y'].diff()
-tracks['dt'] = tracks.groupby('particle')['frame'].diff()
-# Calculate instantaneous speed (distance / time) of the centroid (not ideal) This is per frame (not per sec)
-tracks['speed_int'] = np.sqrt(tracks['dx']**2 + tracks['dy']**2) 
-tracks['speed_roll'] = tracks.groupby('particle')['speed_int'].rolling(
-    window = window_size,
-    min_periods=1).mean().reset_index(level=0, drop=True)
-tracks['ecc_roll'] = tracks.groupby('particle')['eccentricity'].rolling(
-    window = window_size,
-    min_periods=1).mean().reset_index(level=0, drop=True)
-# calculate the area of a rectangle bound by the major and minor axes
-tracks['area_rect'] = tracks['major_axis'] * tracks['minor_axis']
-tracks['area_roll'] = tracks.groupby('particle')['area_rect'].rolling(
-    window = window_size,
-    min_periods=1).mean().reset_index(level=0, drop=True)
-tracks['angvel'] = tracks.groupby('particle')['orientation'].diff()
-# Handle angle wrapping (e.g., crossing the -pi to pi boundary)
-tracks['angvel'] = np.abs(np.arctan2(np.sin(tracks['angvel']), np.cos(tracks['angvel'])))
-tracks['angvel_roll'] = tracks.groupby('particle')['angvel'].rolling(
-    window = window_size,
-    min_periods=1).mean().reset_index(level=0, drop=True)
+    ####### 4. Background subtraction ########
+    if backsub:
+        print("Subtracting background")
+        backsub_frame = np.zeros_like(first_frame, dtype=np.float32)
+        frame_list = np.linspace(1, num_frames - 1, backsub_frames, dtype=int)
+        print("Frames to average for background:", frame_list)
+        for i in frame_list:
+            frame_to_add = tracking.convert_8bit(frames[i])
+            backsub_frame += frame_to_add.astype(np.float32)
+        average_frame = (backsub_frame / backsub_frames).astype(np.uint8)
+        plt.figure()
+        plt.imshow(average_frame, cmap="gray")
+        plt.show(block=False)
 
-# guess at when the animal is turning based on speed and eccentricity
-# print(np.nanmax(tracks['speed']))
-# print(np.nanpercentile(tracks['speed'], 75))
-# print(np.nanpercentile(tracks['speed'], 25))
+        subtracted = [tracking.subtract_background(f, average_frame=average_frame)
+                      for f in frames]
+        frames = subtracted
+        first_frame = subtracted[0]
 
-# Now tracks['particle'] is a persistent worm ID
+    ####### 5. Tracking ########
+    print(f"Tracking and linking objects from {len(frames)} frames")
 
-# visualize the track length of each "worm"
-# if there are background particles, this will lead to a ton of short tracks
+    if thresh is None:
+        _, _, global_thresh = tracking.preprocess_frame(
+            first_frame, min_area, max_area, thresh,
+            illumination=illumination, thresh_method=thresh_method,
+            max_objects=max_objects)
+    else:
+        print("tracking video using manual threshold")
+        global_thresh = thresh
 
-#### summarize some features after filtering ##### 
-counts = tracks.groupby("particle")["frame"].count()
-print('Mean track length is ',np.ceil(np.mean(counts)/2), ' frames')
-print('Minimum track length is ',int(min(counts)))
-print('Maximum track length is ',int(max(counts)))
-#plt.figure(figsize=(10,8))
-binwidth = 25
-plt.hist(counts, bins=range(int(min(counts)), int(max(counts)) + binwidth, binwidth))
-plt.xlabel("length of track in frames")
-plt.title("histogram of worm track lengths")
-plt.xlabel("length of track in frames \nif too many short tracks, try increasing gap_range, \nif your real worms are disconnected, \nor increase threshold if there are too many small objects")
-plt.ylabel("number of worm tracks")
-plt.show()
+    detections = tracking.collect_detections(
+        frames, global_thresh=global_thresh,
+        min_area=min_area, max_area=max_area, illumination=illumination)
 
-# Remove short tracks
-print(f'removing tracks shorter than {min_length} frames')
-tracks = tracking.filter_short_tracks(tracks, min_length=min_length)
+    tracks = tracking.link_tracks(detections, search_range=search_range,
+                                  memory=gap_range, quiet=True)
 
-# # filtering tracks whose object area changes more than 10%
-# tracks = tracking.filter_area_change(tracks, max_area_cv = 0.2)
+    print(f'removing tracks shorter than {min_length} frames')
+    tracks = tracking.filter_short_tracks(tracks, min_length=min_length)
 
-# Plot over first frame
-print('plotting linked and filtered worm tracks')
-tracking.plot_trajectories(stack=first_frame, tracks=tracks, output_path=result_path)
+    ####### 6. Postural analysis ########
+    print("calculating speed and movement states")
 
-# Save the track centroids to a csv file
-print(f'saving tracked centroids to {os.path.join(result_path,"tracks.csv")}')
-tracks.to_csv(os.path.join(result_path,"tracks.csv"), index=False)
+    tracks = tracking.calculate_motion_parameters(
+        tracks,
+        pixel_length=pixel_length,
+        frame_rate=frame_rate,
+        window_size=window_size,
+        direction_threshold=direction_threshold,
+        speed_threshold=speed_threshold,
+        min_run_length=min_run_length,
+        smooth_window=smooth_window,
+        min_displacement_for_angle=min_displacement_for_angle,
+        pirouette_speed_threshold=pirouette_speed_threshold,
+        pirouette_eccentricity_threshold=pirouette_eccentricity_threshold,
+        min_pirouette_duration=min_pirouette_duration,
+        max_instantaneous_speed=max_instantaneous_speed,
+        stability_threshold=stability_threshold
+    )
+
+    ####### 7. Annotated video ########
+    print("Finding particle with all behaviors for demonstration video")
+    best_particle = tracking.find_particle_with_all_behaviors(tracks)
+
+    if best_particle is not None:
+        print(f"Creating annotated video for particle {best_particle}")
+        output_video = tracking.create_annotated_video(
+            video_path=file_path,
+            df=tracks,
+            particle_id=best_particle,
+            output_folder=result_path,
+            pixel_length=pixel_length,
+            frame_rate=frame_rate,
+            global_thresh=global_thresh,
+            min_area=min_area,
+            max_area=max_area,
+            illumination=illumination,
+            crop_size=150,
+            show_mask=True
+        )
+        print(f"Annotated video saved to {output_video}")
+    else:
+        print("No particle found with all three behaviors — skipping annotated video")
+
+    ####### 8. Summary ########
+    counts = tracks.groupby("particle")["frame"].count()
+    print('Mean track length is ', np.ceil(np.mean(counts) / 2), ' frames')
+    print('Minimum track length is ', int(min(counts)))
+    print('Maximum track length is ', int(max(counts)))
+    plt.figure(figsize=(10, 8))
+    binwidth = 25
+    plt.hist(counts, bins=range(int(min(counts)), int(max(counts)) + binwidth, binwidth))
+    plt.xlabel("length of track in frames\nif too many short tracks, try increasing gap_range,\nor increase threshold if there are too many small objects")
+    plt.ylabel("number of worm tracks")
+    plt.title("histogram of worm track lengths")
+    plt.show(block=False)
+
+    print('plotting linked and filtered worm tracks')
+    tracking.plot_trajectories(stack=first_frame, tracks=tracks, output_path=result_path)
+
+    print(f'saving tracked centroids to {os.path.join(result_path, "tracks.csv")}')
+    tracks.to_csv(os.path.join(result_path, "tracks.csv"), index=False)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ODLabTracker — postural mode")
+    parser.add_argument("-f", "--filename", help="Path to input video file")
+    parser.add_argument("-c", "--config",   help="Configuration (yaml) file", required=True)
+    parser.add_argument("-v", "--verbose",  action="store_true")
+    args = parser.parse_args()
+
+    if args.filename:
+        print("batch (non-interactive) mode")
+        file_path = os.path.join(os.getcwd(), args.filename)
+        print(f"Processing file: {file_path}")
+    else:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        file_path = filedialog.askopenfilename(title="Select a Video File")
+        root.destroy()
+
+    config_path = os.path.join(os.getcwd(), args.config)
+    main(file_path, config_path, verbose=args.verbose)

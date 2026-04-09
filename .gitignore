@@ -1,3 +1,12 @@
 .DS_Store
 *.tif
 *.mp4
+*.avi
+*.pkl
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+*_results/

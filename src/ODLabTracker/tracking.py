@@ -21,13 +21,43 @@ from skimage.draw import rectangle_perimeter
 
 # tracking
 import trackpy as tp
+from scipy.ndimage import median_filter
 
 from IPython.display import Video
 
 
 
-def preprocess_frame(img, min_area, max_area, thresh, illumination):
-        # Convert PIL.Image or other inputs to numpy
+THRESH_METHODS = {
+    'otsu':     filters.threshold_otsu,
+    'triangle': filters.threshold_triangle,
+    'yen':      filters.threshold_yen,
+    'li':       filters.threshold_li,
+}
+
+def _count_inrange(gray, thresh, min_area, max_area, illumination):
+    """Return (props_filtered, labeled) at a given threshold (no mask built)."""
+    if illumination == 0:
+        bw = gray > thresh
+    else:
+        bw = gray < thresh
+    bw = morphology.remove_small_objects(bw, min_size=min_area)
+    labeled = measure.label(bw)
+    props = measure.regionprops(labeled)
+    props_filtered = [p for p in props if min_area <= p.area_convex <= max_area]
+    return props_filtered, labeled
+
+
+def preprocess_frame(img, min_area, max_area, thresh, illumination, thresh_method='otsu', max_objects=None):
+    """Threshold a frame and return (mask, props_filtered, thresh_used).
+
+    Parameters
+    ----------
+    max_objects : int or None
+        When thresh=None and max_objects is set, the auto threshold is raised
+        via binary search until the number of in-range objects is <= max_objects.
+        This prevents trackpy subnet explosions from noise frames.
+    """
+    # Convert PIL.Image or other inputs to numpy
     if not isinstance(img, np.ndarray):
         img = np.array(img)
 
@@ -35,8 +65,25 @@ def preprocess_frame(img, min_area, max_area, thresh, illumination):
 
     # Use provided threshold or compute new one
     if thresh is None:
-        print('auto threshold')
-        thresh = filters.threshold_otsu(gray)
+        method_fn = THRESH_METHODS.get(thresh_method, filters.threshold_otsu)
+        thresh = method_fn(gray)
+        print(f'auto threshold ({thresh_method}): {thresh:.1f}', end='')
+
+        # Binary search upward if too many objects detected
+        if max_objects is not None:
+            props_check, _ = _count_inrange(gray, thresh, min_area, max_area, illumination)
+            if len(props_check) > max_objects:
+                lo, hi = int(thresh), 255
+                while lo < hi - 1:
+                    mid = (lo + hi) // 2
+                    p, _ = _count_inrange(gray, mid, min_area, max_area, illumination)
+                    if len(p) <= max_objects:
+                        hi = mid
+                    else:
+                        lo = mid
+                thresh = hi
+                print(f'  → raised to {thresh} (max_objects={max_objects})', end='')
+        print()
 
     if illumination == 0:
         bw = gray > thresh   # worms lighter
@@ -47,14 +94,13 @@ def preprocess_frame(img, min_area, max_area, thresh, illumination):
 
     labeled = measure.label(bw)
     props = measure.regionprops(labeled)
-    areas = measure.regionprops_table(labeled, properties = ['area_convex'])
 
-    mask = np.zeros_like(bw, dtype=bool)
-    for prop in props:
-        if min_area <= prop.area_convex <= max_area:
-            mask[labeled == prop.label] = True
+    # Filter props by area and build mask only from in-range objects
+    props_filtered = [p for p in props if min_area <= p.area_convex <= max_area]
+    keep_labels = np.array([p.label for p in props_filtered])
+    mask = np.isin(labeled, keep_labels)
 
-    return mask, props, thresh
+    return mask, props_filtered, thresh
 
 def draw_boxes_labels(frame, props):
     overlay = np.array(frame).copy()
@@ -70,22 +116,31 @@ def draw_boxes_labels(frame, props):
         overlay[rr, cc] = 255
     return overlay
 
-def show_background(input_video=None,
-                   input_file=None,
-                   first_frame=None,
-                   num_frames=None):
+def show_background(input_video=None, input_file=None, first_frame=None, avg_frame=None, num_frames=None, frames_to_avg=10):
 
+    # make sure frames are uint8:
     if first_frame.ndim == 3 and first_frame.shape[-1] == 3:
         first_frame = rgb2gray(first_frame)
         first_frame = (first_frame * 255).astype(np.uint8)
     elif first_frame.ndim == 2:
         first_frame = first_frame.astype(np.uint8)
 
-    ### check for uneven luminance ####
-    background = filters.gaussian(first_frame, sigma=50, preserve_range=True)
-    backsubbed = (first_frame - background)
+    if avg_frame.ndim == 3 and vg_frame.shape[-1] == 3:
+        avg_frame = rgb2gray(first_frame)
+        avg_frame = (avg_frame * 255).astype(np.uint8)
+    elif avg_frame.ndim == 2:
+        avg_frame = avg_frame.astype(np.uint8)
+        
+    avg_background = avg_frame
 
-    # convert background subtracted image back to uint8 (0-255 integers):
+    # this avoids wraparound values due to negatives after subtraction:
+    # backsubbed = cv2.absdiff(first_frame, avg_background) 
+
+    # clip negative values to zero
+    backsubbed = first_frame.astype(np.int16) - avg_background.astype(np.int16)
+    backsubbed = np.clip(backsubbed, 0, 255).astype(np.uint8)
+
+    # # convert background subtracted image back to uint8 (0-255 integers):
     min_val = np.min(backsubbed)
     max_val = np.max(backsubbed)
     if max_val - min_val == 0:
@@ -99,9 +154,11 @@ def show_background(input_video=None,
         backsubbed = np.round(backsubbed * 255).astype(np.uint8)
         # backsubbed = filters.gaussian(backsubbed, sigma=5, preserve_range=True)
     
-    background_diag = np.diag(background)
-    background_invdiag = np.diag(np.fliplr(background))
+    ### check for uneven luminance ####
+    background_diag = np.diag(avg_background)
+    background_invdiag = np.diag(np.fliplr(avg_background))
     backsubbed_diag = np.diag(backsubbed)
+    first_frame_diag = np.diag(first_frame)
     x = np.arange(len(background_diag))
 
     coefficients_diag = np.polyfit(x, background_diag, 1)
@@ -116,7 +173,7 @@ def show_background(input_video=None,
         backsub = True
         f = plt.figure(figsize = (6,12))
         f.add_subplot(3,1,1)
-        plt.imshow(background, cmap="gray")
+        plt.imshow(avg_background, cmap="gray")
         plt.title(f"Background luminance original and corrected")
         f.add_subplot(3,1,2)
         plt.imshow(first_frame, cmap="gray")
@@ -124,14 +181,16 @@ def show_background(input_video=None,
         plt.imshow(backsubbed, cmap="gray")
 
         plt.figure(figsize=(10, 6))
-        plt.plot(x,background_diag)
-        plt.plot(x,background_invdiag)
-        plt.plot(x,backsubbed_diag)
+        plt.plot(x,background_diag, label='background')
+        # plt.plot(x,background_invdiag)
+        plt.plot(x,backsubbed_diag, label='subtracted')
+        plt.plot(x,first_frame_diag, label='first frame')
+        plt.legend()  
         # imiter_vid = input_video # should be in imiter format
-        print(f"returning background image of type {type(background)}")
+        print(f"returning background image of type {type(avg_background)}")
         print(f"background subtracted image is type {type(backsubbed)}")
 
-    return(background, backsub)
+    return(avg_background, backsub)
 
 def convert_8bit(frame):
     if frame.ndim == 3 and frame.shape[-1] == 3:
@@ -157,26 +216,20 @@ def float_to8bit(frame):
         # print(np.max(frame), np.min(frame))
     return(frame)
 
-def subtract_background(frame,
-                       average_frame):
-    backsubbed = frame.astype(np.float32) / (average_frame.astype(np.float32) + 1)
-    # print(f"max value in avg frame is: {np.max(average_frame)}, min is {np.min(average_frame)}")
-    frame = float_to8bit(backsubbed)
-    return(frame)
+def subtract_background(frame, average_frame, normalize=True):
+    # Subtract background and clip negative values to zero.
+    # normalize=True (default): stretch result to full 0-255 range, which
+    #   improves contrast and makes Otsu auto-thresholding work correctly
+    #   on the background-subtracted image.
+    # normalize=False: preserve original intensity scale (useful if you want
+    #   to apply a fixed manual threshold to the raw subtracted values).
+    backsubbed = frame.astype(np.int16) - average_frame.astype(np.int16)
+    backsubbed = np.clip(backsubbed, 0, 255).astype(np.uint8)
+    if normalize:
+        backsubbed = float_to8bit(backsubbed)
+    return backsubbed
 
-def process_video(min_area, 
-    max_area, 
-    thresh,
-    input_video=None, # should be in imiter format
-    output_path=None, 
-    max_frames=None,
-    fps=None, 
-    save_as="mp4",
-    illumination=0,
-    subsample=None,
-    backsub=None,
-    background=None, 
-    average_frame=None):
+def process_video(min_area, max_area, thresh, input_video=None, output_path=None, max_frames=None, fps=None, save_as="mp4", illumination=0, subsample=None, backsub=None, background=None, average_frame=None):
     """
     Pre-Process TIFF stack or video, to preview the annotation of worms, and optimize settings. Save video with objects detected as MP4 or TIFF stack.
 
@@ -215,33 +268,12 @@ def process_video(min_area,
                     if backsub == True:
                         subtracted = subtract_background(frame = frame, average_frame = average_frame)
                         if i == 0:
-                            thresh = np.percentile(subtracted, .5)
+                            thresh = filters.threshold_otsu(subtracted)
                         frame = subtracted
                     # Append the processed frame to the list
                     frames.append(frame)
         end_time = time.time()
     print(f"Converting frames using imiter of video took {end_time - start_time} seconds")
-
-    # if backsub == True:
-    #     backsubbed = []
-    #     print("subtracting background")
-    #     for i, frame in enumerate(frames):
-    #         backsub_img = (frame - background)
-    #         # convert background subtracted image back to uint8 (0-255 integers):
-    #         min_val = np.min(backsub_img)
-    #         max_val = np.max(backsub_img)
-    #         if max_val - min_val == 0:
-    #             # Handle case of a flat image to avoid division by zero
-    #             backsub_img = np.zeros_like(image_float, dtype=np.uint8)
-    #         else:
-    #             # normalize across the range of values in the subtracted image:
-    #             backsub_img = (backsub_img - min_val) / (max_val - min_val)
-            
-    #         # Scale to 0-255 and convert to uint8
-    #         backsub_img = np.round(backsub_img * 255).astype(np.uint8)
-    #         backsubbed.append(backsub_img)
-    #     frames = backsubbed
-        
     
     first_frame = frames[0]
 
@@ -293,18 +325,18 @@ def process_video(min_area,
     ax.set_xlabel("Area")
     ax.set_ylabel("Number of objects")
     plt.tight_layout()
-    plt.show()
+    plt.show(block=False)
 
     all_areas = []
     for i, frame in enumerate(frames):
         if max_frames and i >= max_frames:
             break
 
-        mask, props, _ = preprocess_frame(frame, 
-                                          min_area, 
-                                          max_area, 
-                                          thresh=global_thresh,
-                                          illumination=illumination)
+        _, props, _ = preprocess_frame(frame,
+                                       min_area,
+                                       max_area,
+                                       thresh=global_thresh,
+                                       illumination=illumination)
                                     # Debug: show first frame
 
         overlay = draw_boxes_labels_gray(frame, props)
@@ -320,7 +352,7 @@ def process_video(min_area,
     f2 = plt.figure(figsize=(6,4))
     plt.hist(all_areas, bins = 20)
     plt.title(f"{len(all_areas)} objects detected (unfiltered, 50 frames)")
-    plt.show()
+    plt.show(block=False)
     
     if save_as == "mp4" and writer:
         writer.close()
@@ -362,28 +394,18 @@ def draw_boxes_labels_gray(frame, props):
 
 def collect_detections(stack, global_thresh, min_area, max_area, illumination=0):
     # this is just a wrapper for preprocess_frame to track centroids
-    frames = stack
     records = []
-    # Convert to grayscale only if RGB
-    for frame_no, frame in enumerate(frames):
-        # print(f"keeping frame {i}")
+    for frame_no, frame in enumerate(stack):
         print(f"\rThresholding and getting centroids for frame: {frame_no}", end="", flush=True)
         time.sleep(0.0001)
-        mask, props, _ = preprocess_frame(frame,
-                                          min_area=min_area,
-                                          max_area=max_area,
-                                          thresh=global_thresh,
-                                          illumination=illumination)
+        _, props, _ = preprocess_frame(frame,
+                                       min_area=min_area,
+                                       max_area=max_area,
+                                       thresh=global_thresh,
+                                       illumination=illumination)
         for prop in props:
-            if prop.area_convex < min_area or prop.area_convex > max_area:
-                print(f"outside size range, size: {prop.area_convex}", end="", flush=True)
-                continue
-            
             y, x = prop.centroid  # note (row, col) = (y, x)
-            # intensity properties (requires the original grayscale image)
-            intensity_image = frame
-            mask_obj = prop.image
-            pixel_vals = intensity_image[prop.slice][mask_obj]
+            pixel_vals = frame[prop.slice][prop.image]
 
             records.append({
                 "frame": frame_no,
@@ -402,7 +424,8 @@ def collect_detections(stack, global_thresh, min_area, max_area, illumination=0)
                 "median_intensity": np.median(pixel_vals),
                 "max_intensity": np.max(pixel_vals),
                 "integrated_intensity": np.sum(pixel_vals)
-                })
+            })
+    print()  # newline after frame counter
     return pd.DataFrame(records)
 
 def link_tracks(detections, search_range=50, memory=3, quiet=False):
@@ -412,10 +435,18 @@ def link_tracks(detections, search_range=50, memory=3, quiet=False):
     memory: how many frames a worm can vanish and still be linked
     """
     print("Linking tracks")
-    # Suppress informational messages from trackpy so output isn't crashed
     if quiet:
         tp.quiet()
-    linked = tp.link_df(detections, search_range=search_range, memory=memory)
+    try:
+        linked = tp.link_df(detections, search_range=search_range, memory=memory)
+    except tp.linking.utils.SubnetOversizeException as e:
+        raise RuntimeError(
+            f"\nTrackpy SubnetOversizeException: search_range={search_range} is too large "
+            f"for the density of detected objects.\n"
+            f"Try reducing 'search_range' in your config file (e.g. to {max(1, search_range // 2)}) "
+            f"or increasing 'min_area'/'max_area' to reduce false detections.\n"
+            f"Original error: {e}"
+        ) from None
     return linked
 
 def draw_tracks_gray(frame, props, tracks, frame_no):
@@ -452,6 +483,94 @@ def filter_short_tracks(tracks, min_length=10):
     counts = tracks.groupby("particle")["frame"].count()
     keep_ids = counts[counts >= min_length].index
     return tracks[tracks["particle"].isin(keep_ids)].copy()
+
+def stitch_tracks(tracks, max_gap_frames, max_gap_pixels):
+    """Post-hoc track stitching: merge track fragments where one ends close in
+    space and time to where another begins.
+
+    Intended for pumping mode where worms are relatively stationary and broken
+    tracks are caused by temporary detection failure rather than identity confusion.
+
+    Parameters
+    ----------
+    tracks : pd.DataFrame
+        Must have 'particle', 'frame', 'x', 'y'.
+    max_gap_frames : int
+        Maximum frame gap between the end of one track and the start of another.
+    max_gap_pixels : float
+        Maximum pixel distance between endpoint and startpoint to be stitched.
+
+    Returns
+    -------
+    tracks : pd.DataFrame with relabelled particle IDs
+    n_stitched : int  number of stitches applied
+    """
+    # Collect per-particle start/end info
+    endpoints = []
+    for pid, g in tracks.groupby("particle"):
+        g = g.sort_values("frame")
+        endpoints.append({
+            "particle":    pid,
+            "start_frame": int(g["frame"].iloc[0]),
+            "start_x":     float(g["x"].iloc[0]),
+            "start_y":     float(g["y"].iloc[0]),
+            "end_frame":   int(g["frame"].iloc[-1]),
+            "end_x":       float(g["x"].iloc[-1]),
+            "end_y":       float(g["y"].iloc[-1]),
+        })
+
+    # Find candidate (from → to) pairs
+    candidates = []
+    for a in endpoints:
+        for b in endpoints:
+            if a["particle"] == b["particle"]:
+                continue
+            gap = b["start_frame"] - a["end_frame"]
+            if not (0 < gap <= max_gap_frames):
+                continue
+            dist = np.sqrt((b["start_x"] - a["end_x"]) ** 2 +
+                           (b["start_y"] - a["end_y"]) ** 2)
+            if dist <= max_gap_pixels:
+                candidates.append({
+                    "from": a["particle"],
+                    "to":   b["particle"],
+                    "gap":  gap,
+                    "dist": dist,
+                    "cost": dist + gap,
+                })
+
+    # Greedy match: sort by cost, each end/start used at most once
+    candidates.sort(key=lambda c: c["cost"])
+    used_ends   = set()
+    used_starts = set()
+    merges = []
+    for c in candidates:
+        if c["from"] not in used_ends and c["to"] not in used_starts:
+            merges.append((c["from"], c["to"]))
+            used_ends.add(c["from"])
+            used_starts.add(c["to"])
+
+    if not merges:
+        return tracks, 0
+
+    # Build canonical ID mapping (resolve chains A→B→C to all→A)
+    mapping = {}
+    for frm, to in merges:
+        canonical = mapping.get(frm, frm)
+        mapping[to] = canonical
+    # Second pass: ensure chained remaps are fully resolved
+    for key in list(mapping):
+        root = mapping[key]
+        while root in mapping:
+            root = mapping[root]
+        mapping[key] = root
+
+    tracks = tracks.copy()
+    tracks["particle"] = tracks["particle"].map(lambda p: mapping.get(p, p))
+    print(f"Stitched {len(merges)} track pairs "
+          f"({tracks['particle'].nunique()} particles remaining)")
+    return tracks, len(merges)
+
 
 def filter_area_change(tracks, max_area_cv = 0.2):
     """
@@ -502,7 +621,7 @@ def plot_trajectories(stack, tracks, output_path, background="first"):
     plt.legend(loc="upper right", fontsize=6)
     plt.title("Worm Trajectories")
     plt.savefig(os.path.join(output_path,"trackPlot.png"))
-    plt.show()
+    plt.show(block=False)
 
 def load_video_frames(path, max_frames=None):
     """
@@ -523,3 +642,1166 @@ def load_video_frames(path, max_frames=None):
         frames.append(frame)
 
     return np.stack(frames, axis=0)
+
+def calculate_motion_parameters(df, 
+                                pixel_length=60,           # pixels/mm
+                                frame_rate=10,             # frames/sec
+                                window_size=7, 
+                                direction_threshold=np.pi/2,
+                                speed_threshold=0.5,       # mm/s
+                                min_run_length=10,
+                                smooth_window=5,           # Increase default smoothing
+                                min_displacement_for_angle=1.5,  # mm
+                                pirouette_speed_threshold=0.3,   # mm/s
+                                pirouette_eccentricity_threshold=0.8,
+                                min_pirouette_duration=2,
+                                max_instantaneous_speed=5.0,     # mm/s - filter outliers
+                                stability_threshold=0.90):        # Higher = stricter
+    """
+    Calculate movement parameters with robust handling of noisy centroids.
+    
+    Parameters:
+    -----------
+    pixel_length : float
+        Pixels per mm conversion factor
+    frame_rate : float
+        Frames per second
+    window_size : int
+        Number of frames for rolling statistics
+    direction_threshold : float
+        Angle change (radians) to detect direction changes
+    speed_threshold : float
+        Minimum speed in mm/s to be considered moving
+    min_run_length : int
+        Minimum frames of stable movement to be considered a run
+    smooth_window : int
+        Window size for position smoothing
+    min_displacement_for_angle : float
+        Minimum displacement in mm to calculate meaningful angle
+    pirouette_speed_threshold : float
+        Maximum speed in mm/s during pirouette
+    pirouette_eccentricity_threshold : float
+        Maximum eccentricity during pirouette (body becomes rounder)
+    min_pirouette_duration : int
+        Minimum number of consecutive frames to be considered a pirouette
+    max_instantaneous_speed : float
+        Maximum plausible speed in mm/s - speeds above this are likely noise
+    stability_threshold : float
+        Direction stability threshold (0-1) for forward runs (higher = stricter)
+    """
+    
+    df = df.copy()
+    df = df.sort_values(['particle', 'frame'])
+    
+    # More aggressive smoothing with larger window
+    df['x_smooth'] = df['x']
+    df['y_smooth'] = df['y']
+    
+    for particle in df['particle'].unique():
+        mask = df['particle'] == particle
+        particle_data = df.loc[mask].copy()
+        
+        if len(particle_data) >= smooth_window:
+            # Median filter is robust to outliers
+            x_smooth = median_filter(particle_data['x'].values, size=smooth_window, mode='nearest')
+            y_smooth = median_filter(particle_data['y'].values, size=smooth_window, mode='nearest')
+            
+            df.loc[mask, 'x_smooth'] = x_smooth
+            df.loc[mask, 'y_smooth'] = y_smooth
+    
+    # Calculate velocities from smoothed positions (in pixels/frame)
+    df['vx_pixels'] = df.groupby('particle')['x_smooth'].diff()
+    df['vy_pixels'] = df.groupby('particle')['y_smooth'].diff()
+    
+    # Convert to physical units (mm/s)
+    df['vx'] = (df['vx_pixels'] / pixel_length) * frame_rate  # mm/s
+    df['vy'] = (df['vy_pixels'] / pixel_length) * frame_rate  # mm/s
+    df['speed_instantaneous'] = np.sqrt(df['vx']**2 + df['vy']**2)  # mm/s
+    
+    # Cap unrealistic speeds (likely noise)
+    df['speed_instantaneous'] = np.clip(df['speed_instantaneous'], 0, max_instantaneous_speed)
+    
+    # Use rolling median speed instead of instantaneous speed
+    # This is much more robust to centroid jitter
+    df['speed'] = (df.groupby('particle')['speed_instantaneous']
+                   .transform(lambda x: x.rolling(window_size, min_periods=1, center=True).median()))
+    
+    # Calculate displacement per frame in mm
+    df['displacement_mm'] = np.sqrt(df['vx_pixels']**2 + df['vy_pixels']**2) / pixel_length
+    
+    # Only calculate movement angle when displacement is meaningful
+    df['movement_angle'] = np.nan
+    significant_motion = df['displacement_mm'] > min_displacement_for_angle
+    df.loc[significant_motion, 'movement_angle'] = np.arctan2(
+        df.loc[significant_motion, 'vx_pixels'], 
+        df.loc[significant_motion, 'vy_pixels']
+    )
+    
+    # Forward fill angles during small movements
+    df['movement_angle'] = df.groupby('particle')['movement_angle'].ffill()
+    
+    # Calculate major axis components (in mm/s)
+    df['major_axis_x'] = np.sin(df['orientation'])
+    df['major_axis_y'] = np.cos(df['orientation'])
+    df['major_axis_component'] = (df['vx'] * df['major_axis_x'] + 
+                                   df['vy'] * df['major_axis_y'])  # mm/s
+    
+    # Calculate angular velocity of orientation (radians/s)
+    df['d_orientation'] = df.groupby('particle')['orientation'].diff()
+    df['d_orientation'] = np.where(
+        df['d_orientation'] > np.pi/2,
+        df['d_orientation'] - np.pi,
+        np.where(df['d_orientation'] < -np.pi/2,
+                 df['d_orientation'] + np.pi,
+                 df['d_orientation'])
+    )
+    df['angular_velocity'] = df['d_orientation'] * frame_rate  # radians/s
+    
+    # Calculate rolling mean of movement angle using circular statistics
+    df['sin_angle'] = np.sin(df['movement_angle'])
+    df['cos_angle'] = np.cos(df['movement_angle'])
+    
+    df['mean_sin'] = (df.groupby('particle')['sin_angle']
+                      .transform(lambda x: x.rolling(window_size, min_periods=1, center=False).mean()))
+    df['mean_cos'] = (df.groupby('particle')['cos_angle']
+                      .transform(lambda x: x.rolling(window_size, min_periods=1, center=False).mean()))
+    
+    df['mean_movement_angle'] = np.arctan2(df['mean_sin'], df['mean_cos'])
+    
+    # Calculate directional stability as resultant vector length
+    df['direction_stability'] = np.sqrt(df['mean_sin']**2 + df['mean_cos']**2)
+    
+    # Calculate mean speed (mm/s)
+    df['mean_speed'] = (df.groupby('particle')['speed']
+                       .transform(lambda x: x.rolling(window_size, min_periods=1).mean()))
+    
+    # Calculate speed variability (coefficient of variation)
+    df['speed_std'] = (df.groupby('particle')['speed']
+                       .transform(lambda x: x.rolling(window_size, min_periods=1).std()))
+    
+    # Coefficient of variation (std/mean) - low values indicate steady movement
+    df['speed_cv'] = df['speed_std'] / (df['mean_speed'] + 1e-6)  # Add small value to avoid division by zero
+    
+    # Calculate angular difference from recent mean direction
+    df['angle_from_mean'] = df['movement_angle'] - df['mean_movement_angle']
+    df['angle_from_mean'] = np.where(
+        df['angle_from_mean'] > np.pi,
+        df['angle_from_mean'] - 2*np.pi,
+        np.where(df['angle_from_mean'] < -np.pi,
+                 df['angle_from_mean'] + 2*np.pi,
+                 df['angle_from_mean'])
+    )
+    
+    # Detect moving and stable states
+    df['is_moving'] = df['speed'] > speed_threshold
+    
+    # Stricter criteria for directional stability
+    # Must have: good direction consistency, steady speed, and sustained movement
+    df['is_directionally_stable'] = (
+        df['is_moving'] & 
+        (df['direction_stability'] > stability_threshold) &  # Very consistent direction
+        (df['mean_speed'] > speed_threshold) &               # Sustained speed
+        (df['speed_cv'] < 0.6)                                # Speed not too erratic (CV < 60%)
+    )
+    
+    # Count consecutive stable frames
+    def count_consecutive_true(series):
+        """Count consecutive True values, reset on False."""
+        result = np.zeros(len(series), dtype=int)
+        count = 0
+        for i, val in enumerate(series):
+            if val:
+                count += 1
+                result[i] = count
+            else:
+                count = 0
+        return result
+    
+    df['stable_run_counter'] = (df.groupby('particle')['is_directionally_stable']
+                                 .transform(count_consecutive_true))
+
+   # ========== REVERSAL DETECTION ==========
+    # Detect reversal START: large angle change after stable run
+    prev_stable_run = df.groupby('particle')['stable_run_counter'].shift(1)
+    prev_stationary = df.groupby('particle')['speed'].shift(1) < speed_threshold
+    prev_angle = df.groupby('particle')['angle_from_mean'].shift(1).abs()
+    
+    df['reversal_start'] = (
+        ( (prev_stable_run >= 0) | prev_stationary == True ) &
+        (np.abs(df['angle_from_mean']) > direction_threshold) &
+        (df['speed'] > speed_threshold) &  # Allow slightly slower
+        (prev_angle.fillna(0) <= direction_threshold)
+    )
+    
+    # Detect any large direction change (both reversal starts and returns to forward)
+    df['direction_change_event'] = (
+        (np.abs(df['angle_from_mean']) > direction_threshold) &
+        (prev_angle.fillna(0) <= direction_threshold)
+    )
+    
+   # Mark reversal periods: from reversal_start until the next direction_change
+    # During reversal, speed should be about half of forward run
+    df['is_reversal'] = False
+    df['reversal_id'] = 0  # Track which reversal event
+    
+    for particle in df['particle'].unique():
+        mask = df['particle'] == particle
+        particle_df = df.loc[mask].copy()
+        
+        in_reversal = False
+        reversal_counter = 0
+        reversal_start_frame = 0
+        is_reversal_list = []
+        reversal_id_list = []
+        
+        for i, (rev_start, dir_change, spd) in enumerate(zip(particle_df['reversal_start'], 
+                                              particle_df['direction_change_event'],
+                                              particle_df['speed'])):
+            if rev_start:
+                # Start of a reversal
+                in_reversal = True
+                reversal_counter += 1
+                reversal_start_frame = i
+                is_reversal_list.append(True)
+                reversal_id_list.append(reversal_counter)
+            elif in_reversal and dir_change:
+                # End of reversal (another direction change = start of new forward run)
+                in_reversal = False
+                is_reversal_list.append(False)
+                reversal_id_list.append(0)
+            elif in_reversal and (i - reversal_start_frame) >= 3*frame_rate: # 3 seconds max
+                # Reversal has gone on too long - likely a mis-annotation
+                # End the reversal
+                in_reversal = False
+                is_reversal_list.append(False)
+                reversal_id_list.append(0)
+            elif in_reversal and spd > speed_threshold * 0.4:
+                # Still in reversal (speed is about half of forward run)
+                is_reversal_list.append(True)
+                reversal_id_list.append(reversal_counter)
+            elif in_reversal:
+                # Speed dropped too low - probably stopped or pirouetting
+                # End the reversal
+                in_reversal = False
+                is_reversal_list.append(False)
+                reversal_id_list.append(0)
+            else:
+                # Not in reversal
+                is_reversal_list.append(False)
+                reversal_id_list.append(0)
+
+        df.loc[mask, 'is_reversal'] = is_reversal_list
+        df.loc[mask, 'reversal_id'] = reversal_id_list
+    
+    # Also track reversal end explicitly
+    prev_reversal = df.groupby('particle')['is_reversal'].shift(1)
+    df['reversal_end'] = (prev_reversal == True) & ~df['is_reversal']
+
+    
+    # ========== PIROUETTE DETECTION ==========
+    df['is_pirouette_frame'] = (
+        (df['speed'] < pirouette_speed_threshold) &
+        (df['eccentricity'] < pirouette_eccentricity_threshold)
+    )
+    
+    # Count consecutive pirouette frames
+    df['pirouette_duration'] = (df.groupby('particle')['is_pirouette_frame']
+                                .transform(count_consecutive_true))
+    
+    # Mark as pirouette only if duration exceeds minimum
+    df['is_pirouette'] = df['pirouette_duration'] >= min_pirouette_duration
+    
+    # Detect pirouette start (first frame of a pirouette event)
+    prev_pirouette = df.groupby('particle')['is_pirouette'].shift(1)
+    df['pirouette_start'] = df['is_pirouette'] & (prev_pirouette != True)
+    
+    # Classify pirouette type based on what preceded it
+    df['pirouette_type'] = None
+    
+    # Check if pirouette follows a reversal (within N frames)
+    frames_after_reversal_threshold = 5
+    df['recent_reversal'] = (
+        df.groupby('particle')['reversal_start']
+        .transform(lambda x: x.rolling(frames_after_reversal_threshold, min_periods=1).sum() > 0)
+    )
+    
+    # Classify pirouette types
+    df.loc[df['pirouette_start'] & df['recent_reversal'], 'pirouette_type'] = 'post_reversal'
+    df.loc[df['pirouette_start'] & ~df['recent_reversal'], 'pirouette_type'] = 'spontaneous'
+    
+    # Forward fill pirouette type for duration of pirouette
+    for particle in df['particle'].unique():
+        mask = df['particle'] == particle
+        particle_df = df.loc[mask].copy()
+        
+        current_type = None
+        pirouette_types = []
+        
+        for is_pir, pir_type in zip(particle_df['is_pirouette'], particle_df['pirouette_type']):
+            if pir_type is not None:  # Start of new pirouette
+                current_type = pir_type
+            
+            if is_pir:
+                pirouette_types.append(current_type)
+            else:
+                pirouette_types.append(None)
+                current_type = None
+        
+        df.loc[mask, 'pirouette_type'] = pirouette_types   
+
+    
+    # ========== CLASSIFY MOVEMENT TYPE ==========
+    # Priority: pirouette > reversal > forward_run > short_run > meandering > stationary
+    df['movement_type'] = 'stationary'
+    df.loc[df['is_moving'] & ~df['is_directionally_stable'], 'movement_type'] = 'meandering'
+    df.loc[df['is_directionally_stable'] & (df['stable_run_counter'] < min_run_length), 'movement_type'] = 'short_run'
+    df.loc[df['is_directionally_stable'] & (df['stable_run_counter'] >= min_run_length), 'movement_type'] = 'forward_run'
+    df.loc[df['is_reversal'], 'movement_type'] = 'reversal'
+    df.loc[df['is_pirouette'], 'movement_type'] = 'pirouette'
+    
+    # Count frames since last reversal
+    df['frames_since_reversal'] = 0
+    for particle in df['particle'].unique():
+        mask = df['particle'] == particle
+        particle_df = df.loc[mask].copy()
+        
+        frames_since = 0
+        frames_list = []
+        
+        for is_rev in particle_df['reversal_start']:
+            if is_rev:
+                frames_since = 0
+            else:
+                frames_since += 1
+            frames_list.append(frames_since)
+        
+        df.loc[mask, 'frames_since_reversal'] = frames_list
+    
+    # Count frames since last pirouette
+    df['frames_since_pirouette'] = 0
+    for particle in df['particle'].unique():
+        mask = df['particle'] == particle
+        particle_df = df.loc[mask].copy()
+        
+        frames_since = 0
+        frames_list = []
+        
+        for is_pir_start in particle_df['pirouette_start']:
+            if is_pir_start:
+                frames_since = 0
+            else:
+                frames_since += 1
+            frames_list.append(frames_since)
+        
+        df.loc[mask, 'frames_since_pirouette'] = frames_list
+    
+    return df
+
+# Example usage and interpretation
+def classify_movement(row):
+    """
+    Classify whether the object is moving forward or backward along its major axis.
+    """
+    if pd.isna(row['major_axis_component']):
+        return 'no_data'
+    elif abs(row['major_axis_component']) < 0.1:  # adjust threshold as needed
+        return 'stationary'
+    elif row['major_axis_component'] > 0:
+        return 'forward'
+    else:
+        return 'backward'
+
+def create_annotated_video(video_path, df, particle_id, output_folder, 
+                           pixel_length=60, frame_rate=10,
+                           global_thresh=None, min_area=100, max_area=5000,
+                           illumination=0, crop_size=150, show_mask=True):
+    """
+    Create a video of a single particle with movement type annotations.
+    
+    Parameters:
+    -----------
+    video_path : str
+        Path to the original video file
+    df : pandas DataFrame
+        DataFrame with tracking data and movement classifications
+    particle_id : int
+        ID of the particle to visualize
+    output_folder : str
+        Folder to save the output video
+    pixel_length : float
+        Pixels per mm (for scale bar)
+    frame_rate : int
+        Frames per second
+    global_thresh : int
+        Threshold value for segmentation (if None, will estimate)
+    min_area : int
+        Minimum area for objects
+    max_area : int
+        Maximum area for objects
+    illumination : int
+        0 for dark objects on bright background, 1 for bright on dark
+    crop_size : int
+        Size of the cropped region around the particle
+    show_mask : bool
+        If True, overlay colored mask on worm. If False, just show bounding box
+    """
+    
+    # Get data for this particle
+    particle_df = df[df['particle'] == particle_id].copy()
+    particle_df = particle_df.sort_values('frame')
+    
+    if len(particle_df) == 0:
+        print(f"No data found for particle {particle_id}")
+        return
+    
+    # Check if particle has all three movement types
+    movement_types = particle_df['movement_type'].unique()
+    has_forward = 'forward_run' in movement_types
+    has_reversal = 'is_reversal' in particle_df.columns and particle_df['is_reversal'].any()
+    has_pirouette = 'is_pirouette' in particle_df.columns and particle_df['is_pirouette'].any()
+    
+    print(f"Particle {particle_id} has:")
+    print(f"  Forward runs: {has_forward}")
+    print(f"  Reversals: {has_reversal}")
+    print(f"  Pirouettes: {has_pirouette}")
+    
+    # Open video
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error: Could not open video {video_path}")
+        return
+    
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # Auto-threshold if not provided
+    if global_thresh is None:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        ret, sample_frame = cap.read()
+        if ret:
+            if len(sample_frame.shape) == 3:
+                sample_frame = cv2.cvtColor(sample_frame, cv2.COLOR_BGR2GRAY)
+            from skimage import filters
+            global_thresh = int(filters.threshold_otsu(sample_frame))
+            print(f"Auto-detected threshold: {global_thresh}")
+    
+    # Create output video - with cropped view on the side
+    output_width = width + crop_size + 20  # Original + crop + margin
+    output_height = max(height, crop_size + 250)  # Accommodate info panel
+    
+    video_name = os.path.basename(video_path)
+    output_path = os.path.join(output_folder, f'particle_{particle_id}_annotated.mp4')
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (output_width, output_height))
+    
+    # Colors for different movement types (BGR format)
+    colors = {
+        'stationary': (128, 128, 128),      # Gray
+        'meandering': (0, 255, 255),        # Yellow
+        'short_run': (255, 200, 100),       # Light blue
+        'forward_run': (0, 255, 0),         # Green
+        'reversal': (0, 0, 255),            # Red
+        'pirouette': (255, 0, 255)          # Magenta
+    }
+    
+    # Get frame range for this particle
+    start_frame = int(particle_df['frame'].min())
+    end_frame = int(particle_df['frame'].max())
+    
+    # Set video to start frame
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    
+    frame_idx = start_frame
+    prev_movement_type = None
+    
+    while frame_idx <= end_frame:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Convert to grayscale for processing
+        if len(frame.shape) == 3:
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_frame = frame.copy()
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        
+        # Create output canvas
+        canvas = np.zeros((output_height, output_width, 3), dtype=np.uint8)
+        canvas[:height, :width] = frame
+        
+        # Get data for current frame
+        frame_data = particle_df[particle_df['frame'] == frame_idx]
+        
+        if len(frame_data) > 0:
+            row = frame_data.iloc[0]
+            
+            # Get position
+            x = int(row['x'])
+            y = int(row['y'])
+            
+            # Get movement type
+            movement_type = row['movement_type']
+            color = colors.get(movement_type, (255, 255, 255))
+            
+            # Segment the frame to find this particle using preprocess_frame
+            _, props, _ = preprocess_frame(gray_frame,
+                                           min_area=min_area,
+                                           max_area=max_area,
+                                           thresh=global_thresh,
+                                           illumination=illumination)
+            
+            # Find the region closest to the tracked centroid
+            best_prop = None
+            min_dist = float('inf')
+            for prop in props:
+                prop_y, prop_x = prop.centroid
+                dist = np.sqrt((prop_x - x)**2 + (prop_y - y)**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_prop = prop
+            
+            if best_prop is not None and min_dist < 20:  # Within 20 pixels
+                # Draw mask overlay on main view
+                if show_mask:
+                    # Create colored mask using the returned mask from preprocess_frame
+                    colored_mask = np.zeros_like(frame)
+                    # Get this specific object's mask
+                    object_mask = np.zeros((height, width), dtype=bool)
+                    object_mask[best_prop.slice][best_prop.image] = True
+                    colored_mask[object_mask] = color
+                    
+                    # Blend with original
+                    canvas[:height, :width] = cv2.addWeighted(frame, 0.7, colored_mask, 0.3, 0)
+                
+                # Draw bounding box on main view
+                minr, minc, maxr, maxc = best_prop.bbox
+                cv2.rectangle(canvas, (minc, minr), (maxc, maxr), color, 2)
+                
+                # Draw orientation arrow
+                if 'orientation' in row:
+                    orientation = row['orientation']
+                    arrow_length = 40
+                    end_x = int(x + arrow_length * np.sin(orientation))
+                    end_y = int(y + arrow_length * np.cos(orientation))
+                    cv2.arrowedLine(canvas, (x, y), (end_x, end_y), color, 3, tipLength=0.3)
+                
+                # Create cropped view
+                half_crop = crop_size // 2
+                x_start = max(0, x - half_crop)
+                x_end = min(width, x + half_crop)
+                y_start = max(0, y - half_crop)
+                y_end = min(height, y + half_crop)
+                
+                # Extract crop from blended image
+                crop = canvas[y_start:y_end, x_start:x_end].copy()
+                
+                # Resize to fixed size if needed
+                if crop.shape[0] > 0 and crop.shape[1] > 0:
+                    crop_resized = cv2.resize(crop, (crop_size, crop_size))
+                    
+                    # Add border
+                    crop_bordered = cv2.copyMakeBorder(crop_resized, 3, 3, 3, 3, 
+                                                       cv2.BORDER_CONSTANT, value=color)
+                    
+                    # Place in canvas
+                    canvas[10:10+crop_size+6, width+10:width+10+crop_size+6] = crop_bordered
+                
+                # Draw crosshair on main view
+                cv2.drawMarker(canvas, (x, y), color, cv2.MARKER_CROSS, 15, 2)
+            
+            # Draw trajectory (past 60 frames)
+            past_frames = particle_df[
+                (particle_df['frame'] <= frame_idx) & 
+                (particle_df['frame'] > frame_idx - 60)
+            ]
+            if len(past_frames) > 1:
+                points = np.array([[int(r['x']), int(r['y'])] for _, r in past_frames.iterrows()])
+                cv2.polylines(canvas[:height, :width], [points], False, color, 2)
+            
+            # Detect movement type transitions
+            if prev_movement_type is not None and movement_type != prev_movement_type:
+                transition_text = f"{prev_movement_type} -> {movement_type}"
+                cv2.putText(canvas, "TRANSITION!", (width + 10, crop_size + 40), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.putText(canvas, transition_text, (width + 10, crop_size + 70), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            
+            prev_movement_type = movement_type
+            
+            # Add text overlay with current state (on right side)
+            info_x = width + 10
+            info_y_start = crop_size + 100
+            
+            cv2.putText(canvas, f"Particle: {particle_id}", (info_x, info_y_start), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(canvas, f"Frame: {frame_idx}", (info_x, info_y_start + 25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(canvas, f"Type:", (info_x, info_y_start + 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(canvas, f"{movement_type}", (info_x, info_y_start + 75), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Add speed if available
+            if 'speed' in row:
+                speed_text = f"Speed: {row['speed']:.2f} mm/s"
+                cv2.putText(canvas, speed_text, (info_x, info_y_start + 100), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            
+            # Add eccentricity for pirouettes
+            if 'eccentricity' in row:
+                ecc_text = f"Ecc: {row['eccentricity']:.2f}"
+                cv2.putText(canvas, ecc_text, (info_x, info_y_start + 125), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            
+            # Add legend at bottom
+            legend_y = output_height - 160
+            cv2.putText(canvas, "Legend:", (10, legend_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            for i, (mt, col) in enumerate(colors.items()):
+                y_pos = legend_y + 20 + i * 20
+                cv2.rectangle(canvas, (10, y_pos - 12), (30, y_pos), col, -1)
+                cv2.putText(canvas, mt, (35, y_pos), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        out.write(canvas)
+        frame_idx += 1
+        
+        # Progress indicator
+        if frame_idx % 10 == 0:
+            print(f"\rProcessing frame {frame_idx}/{end_frame}", end="", flush=True)
+    
+    cap.release()
+    out.release()
+    
+    print(f"\nVideo saved to: {output_path}")
+    return output_path
+
+
+# The find_particle_with_all_behaviors function remains the same
+def find_particle_with_all_behaviors(df):
+    """
+    Find a particle that exhibits forward run, reversal, and pirouette.
+    """
+    candidates = []
+    
+    for particle_id in df['particle'].unique():
+        particle_df = df[df['particle'] == particle_id]
+        
+        # Check for each behavior
+        has_forward = (particle_df['movement_type'] == 'forward_run').any()
+        has_reversal = particle_df['is_reversal'].any() if 'is_reversal' in particle_df.columns else False
+        has_pirouette = particle_df['is_pirouette'].any() if 'is_pirouette' in particle_df.columns else False
+        
+        behavior_count = sum([has_forward, has_reversal, has_pirouette])
+        
+        if behavior_count == 3:  # Has all three
+            # Count how many of each
+            forward_frames = (particle_df['movement_type'] == 'forward_run').sum()
+            reversal_frames = particle_df['is_reversal'].sum()
+            pirouette_frames = particle_df['is_pirouette'].sum()
+            distance_traveled = np.sqrt( (particle_df['x'].max() - particle_df['x'].min())**2 + (particle_df['y'].max() - particle_df['y'].min())**2 ) / 60
+            
+            candidates.append({
+                'particle': particle_id,
+                'track_length': len(particle_df),
+                'forward_frames': forward_frames,
+                'reversal_frames': reversal_frames,
+                'pirouette_frames': pirouette_frames,
+                'distance_traveled': distance_traveled,
+                'score': min(len(particle_df), distance_traveled)
+            })
+    
+    if not candidates:
+        print("No particle found with all three behaviors (forward, reversal, pirouette)")
+        return None
+    
+    # Sort by score
+    candidates.sort(key=lambda x: x['score'], reverse=True)
+    
+    best = candidates[0]
+    print(f"\nBest particle for demonstration: {best['particle']}")
+    print(f"  Track length: {best['track_length']} frames")
+    print(f"  Distance traveled: {best['distance_traveled']} mm")
+    print(f"  Forward run frames: {best['forward_frames']}")
+    print(f"  Reversal frames: {best['reversal_frames']}")
+    print(f"  Pirouette frames: {best['pirouette_frames']}")
+    
+    return best['particle']
+
+
+# ── Pumping analysis functions ────────────────────────────────────────────────
+
+def collect_detections_pumping(stack, global_thresh, min_area, max_area, illumination=0):
+    """Like collect_detections but also stores per-ROI pixel arrays for pharynx reconstruction.
+
+    Returns
+    -------
+    detections : pd.DataFrame
+        One row per detection; includes _det_id column for later pixel lookup.
+    pixel_store : dict
+        {det_id: {'intensities': np.ndarray, 'mask': np.ndarray, 'bbox': tuple}}
+    """
+    records = []
+    pixel_store = {}
+    det_id = 0
+    for frame_no, frame in enumerate(stack):
+        print(f"\rThresholding and getting centroids for frame: {frame_no}", end="", flush=True)
+        time.sleep(0.0001)
+        _, props, _ = preprocess_frame(frame,
+                                       min_area=min_area,
+                                       max_area=max_area,
+                                       thresh=global_thresh,
+                                       illumination=illumination)
+        for prop in props:
+            y, x = prop.centroid
+            pixel_vals = frame[prop.slice][prop.image]
+            records.append({
+                "frame":                frame_no,
+                "x":                    x,
+                "y":                    y,
+                "area":                 prop.area,
+                "area_convex":          prop.area_convex,
+                "mean_intensity":       float(np.mean(pixel_vals)),
+                "max_intensity":        float(np.max(pixel_vals)),
+                "integrated_intensity": float(np.sum(pixel_vals)),
+                "_det_id":              det_id,
+            })
+            pixel_store[det_id] = {
+                "intensities": pixel_vals.copy(),
+                "mask":        prop.image.copy(),  # bool array within bbox
+                "bbox":        prop.bbox,           # (min_row, min_col, max_row, max_col)
+            }
+            det_id += 1
+    print()
+    return pd.DataFrame(records), pixel_store
+
+
+def build_pixel_store_for_tracks(tracks, raw_pixel_store):
+    """Remap pixel_store keys from det_id to (particle, frame) after track linking.
+
+    Drops _det_id from tracks in-place and returns the remapped dict.
+    """
+    final_store = {}
+    for _, row in tracks.iterrows():
+        did = int(row["_det_id"])
+        if did in raw_pixel_store:
+            final_store[(int(row["particle"]), int(row["frame"]))] = raw_pixel_store[did]
+    tracks.drop(columns=["_det_id"], inplace=True, errors="ignore")
+    return final_store
+
+
+def analyze_pumping(tracks, frame_rate, min_track_frames=None, peak_prominence=10):
+    """Detect pumping peaks per particle using scipy and pyampd (if installed).
+
+    Parameters
+    ----------
+    tracks : pd.DataFrame
+        Must contain 'particle', 'frame', 'mean_intensity'.
+    frame_rate : int
+        Frames per second.
+    min_track_frames : int or None
+        Minimum track length to analyse. Default: 1 second (= frame_rate frames).
+    peak_prominence : float
+        Prominence threshold for scipy.signal.find_peaks.
+
+    Returns
+    -------
+    pump_events : pd.DataFrame
+        Columns: particle, frame, time_s, method ('scipy' | 'ampd')
+    pump_summary : pd.DataFrame
+        Columns: particle, track_duration_s, n_pumps_scipy, mean_rate_hz_scipy,
+                 n_pumps_ampd, mean_rate_hz_ampd  (ampd cols None if unavailable)
+    """
+    from scipy.signal import find_peaks
+
+    try:
+        from pyampd.ampd import find_peaks as ampd_find_peaks
+        has_ampd = True
+    except ImportError:
+        has_ampd = False
+        print("pyampd not installed — using scipy peak detection only")
+
+    if min_track_frames is None:
+        min_track_frames = frame_rate  # 1 second default
+
+    pump_events  = []
+    pump_summary = []
+
+    for particle, group in tracks.groupby("particle"):
+        group = group.sort_values("frame")
+        if len(group) < min_track_frames:
+            continue
+
+        frames_arr = group["frame"].values
+        intensity  = group["mean_intensity"].values
+        duration_s = len(frames_arr) / frame_rate
+
+        # ── scipy ──────────────────────────────────────────────────────────────
+        scipy_idx, _ = find_peaks(intensity, prominence=peak_prominence)
+        for idx in scipy_idx:
+            pump_events.append({
+                "particle": particle,
+                "frame":    int(frames_arr[idx]),
+                "time_s":   round(float(frames_arr[idx]) / frame_rate, 4),
+                "method":   "scipy",
+            })
+
+        # ── pyampd ─────────────────────────────────────────────────────────────
+        ampd_idx = []
+        if has_ampd:
+            try:
+                ampd_idx = list(ampd_find_peaks(intensity))
+                for idx in ampd_idx:
+                    pump_events.append({
+                        "particle": particle,
+                        "frame":    int(frames_arr[idx]),
+                        "time_s":   round(float(frames_arr[idx]) / frame_rate, 4),
+                        "method":   "ampd",
+                    })
+            except Exception as e:
+                print(f"  pyampd failed for particle {particle}: {e}")
+
+        pump_summary.append({
+            "particle":           particle,
+            "track_duration_s":   round(duration_s, 2),
+            "n_pumps_scipy":      len(scipy_idx),
+            "mean_rate_hz_scipy": round(len(scipy_idx) / duration_s, 3) if duration_s > 0 else None,
+            "n_pumps_ampd":       len(ampd_idx) if has_ampd else None,
+            "mean_rate_hz_ampd":  round(len(ampd_idx) / duration_s, 3) if has_ampd and duration_s > 0 else None,
+        })
+
+    return pd.DataFrame(pump_events), pd.DataFrame(pump_summary)
+
+
+def find_best_pumping_particle(tracks, pump_summary):
+    """Pick the longest track with the most detected pumps (scipy)."""
+    if pump_summary.empty:
+        print("No particles met the minimum track length for pumping analysis.")
+        return None
+    scored = pump_summary.copy()
+    scored["score"] = scored["track_duration_s"] * scored["n_pumps_scipy"].fillna(0)
+    best_row = scored.loc[scored["score"].idxmax()]
+    best = int(best_row["particle"])
+    print(f"\nBest pumping particle: {best}")
+    print(f"  Track duration:  {best_row['track_duration_s']:.1f} s")
+    print(f"  Pumps (scipy):   {best_row['n_pumps_scipy']}")
+    if best_row["n_pumps_ampd"] is not None:
+        print(f"  Pumps (ampd):    {best_row['n_pumps_ampd']}")
+    return best
+
+
+def _pump_rate_color(rate_hz):
+    """Trail colour keyed to rolling pump rate (BGR)."""
+    if rate_hz > 4:
+        return (255, 0, 255)    # magenta
+    elif rate_hz >= 2:
+        return (0, 220, 255)    # yellow
+    else:
+        return (150, 150, 150)  # grey
+
+
+def _draw_intensity_panel(canvas, x_off, y_off, panel_w, panel_h,
+                          intensity_vals, is_pump_vals):
+    """Render a rolling intensity trace with pump-event markers into canvas."""
+    # Dark background
+    cv2.rectangle(canvas, (x_off, y_off),
+                  (x_off + panel_w - 1, y_off + panel_h - 1), (35, 35, 35), -1)
+
+    n = len(intensity_vals)
+    if n < 2:
+        return
+
+    mg = 12  # margin px
+    pw, ph = panel_w - 2 * mg, panel_h - 2 * mg
+    y_min = min(intensity_vals) * 0.92
+    y_max = max(intensity_vals) * 1.08
+    if y_max <= y_min:
+        y_max = y_min + 1
+
+    def to_px(i, val):
+        cx = x_off + mg + int(i * pw / max(n - 1, 1))
+        cy = y_off + mg + int(ph - (val - y_min) / (y_max - y_min) * ph)
+        cy = max(y_off + mg, min(y_off + mg + ph, cy))
+        return cx, cy
+
+    # Intensity trace
+    for i in range(1, n):
+        cv2.line(canvas, to_px(i - 1, intensity_vals[i - 1]),
+                 to_px(i,     intensity_vals[i]),
+                 (210, 210, 210), 1)
+
+    # Pump event markers: red dot on the peak
+    for i, is_pump in enumerate(is_pump_vals):
+        if is_pump:
+            cx, cy = to_px(i, intensity_vals[i])
+            cv2.circle(canvas, (cx, cy), 3, (0, 0, 220), -1)
+
+    # Current-position cursor (white vertical)
+    cx, _ = to_px(n - 1, intensity_vals[-1])
+    cv2.line(canvas, (cx, y_off + mg), (cx, y_off + mg + ph), (255, 255, 255), 1)
+
+    # Axis labels
+    cv2.putText(canvas, f"{y_max:.0f}",
+                (x_off + 2, y_off + mg + 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (160, 160, 160), 1)
+    cv2.putText(canvas, f"{y_min:.0f}",
+                (x_off + 2, y_off + mg + ph),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (160, 160, 160), 1)
+    cv2.putText(canvas, "Mean intensity",
+                (x_off + mg, y_off + panel_h - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (160, 160, 160), 1)
+
+
+def create_pumping_video(video_path, tracks, pump_events, particle_id,
+                         output_folder, frame_rate=20,
+                         global_thresh=None, min_area=50, max_area=300,
+                         illumination=0, crop_size=None, pump_method="scipy"):
+    """Create annotated pumping video for a single particle.
+
+    Right panel layout (top → bottom):
+      - Contrast-normalised crop of the worm (global normalization, stable across frames)
+      - Particle info text (ID, time, rate, count)
+      - Rolling intensity plot with pump-event markers
+
+    The right panel is half the video width. The crop is extracted at crop_size pixels
+    but displayed scaled up to fill the panel width.
+
+    Trail on the main frame is coloured by rolling pump rate:
+      > 4 Hz  → magenta  |  2–4 Hz → yellow  |  < 2 Hz → grey
+    No ROI boxes, masks, or crosshairs are drawn on the worm.
+    Crop and trail persist on dropped frames using last known position.
+    """
+    particle_df    = tracks[tracks["particle"] == particle_id].copy().sort_values("frame")
+    particle_pumps = pump_events[
+        (pump_events["particle"] == particle_id) &
+        (pump_events["method"]   == pump_method)
+    ]
+    pump_frames = set(particle_pumps["frame"].tolist())
+
+    if len(particle_df) == 0:
+        print(f"No data for particle {particle_id}")
+        return None
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Cannot open video: {video_path}")
+        return None
+
+    fps    = cap.get(cv2.CAP_PROP_FPS) or frame_rate
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Crop extraction size: slightly wider than the median object diameter
+    if crop_size is None:
+        median_area = float(particle_df["area"].median())
+        obj_radius  = np.sqrt(median_area / np.pi)  # equivalent-circle radius
+        crop_size   = int(obj_radius * 2.5)          # ~25% padding each side
+        crop_size   = max(crop_size, 20)
+    print(f"  Crop extraction size: {crop_size}px  (median area={particle_df['area'].median():.0f})")
+
+    # Right panel is half the video width; crop display fills it (minus border)
+    panel_w           = width // 2
+    border            = 3
+    display_crop_size = panel_w - 2 * border   # px used for the scaled crop display
+    info_h    = 110                             # info text area height
+    plot_h    = height - (display_crop_size + 2 * border) - info_h
+    plot_h    = max(plot_h, 80)
+
+    output_width  = width + panel_w
+    output_height = height
+
+    # ── Pre-pass: compute stable global crop normalization bounds ─────────────
+    # Sample up to 30 evenly-spaced particle frames to estimate the pixel range
+    # in the crop region. This avoids per-frame auto-contrast flicker.
+    sample_idx   = particle_df.index[
+        np.linspace(0, len(particle_df) - 1, min(30, len(particle_df)), dtype=int)
+    ]
+    sample_df    = particle_df.loc[sample_idx]
+    crop_pixels  = []
+    half         = crop_size // 2
+    cap2         = cv2.VideoCapture(video_path)
+    for _, srow in sample_df.iterrows():
+        sf = int(srow["frame"])
+        cap2.set(cv2.CAP_PROP_POS_FRAMES, sf)
+        ret2, frm2 = cap2.read()
+        if not ret2:
+            continue
+        gf2 = cv2.cvtColor(frm2, cv2.COLOR_BGR2GRAY) if frm2.ndim == 3 else frm2
+        cx, cy = int(srow["x"]), int(srow["y"])
+        xs2, xe2 = max(0, cx - half), min(width,  cx + half)
+        ys2, ye2 = max(0, cy - half), min(height, cy + half)
+        crop2 = gf2[ys2:ye2, xs2:xe2]
+        if crop2.size > 0:
+            crop_pixels.append(crop2.flatten())
+    cap2.release()
+
+    if crop_pixels:
+        all_pix = np.concatenate(crop_pixels)
+        # Use global_thresh as lower bound to clip background pixels out entirely.
+        # Fall back to 30th percentile if thresh is unavailable.
+        if global_thresh is not None:
+            crop_lo = float(global_thresh)
+        else:
+            crop_lo = float(np.percentile(all_pix, 30))
+        crop_hi = float(np.percentile(all_pix, 99))
+    else:
+        crop_lo = float(global_thresh) if global_thresh is not None else 30.0
+        crop_hi = 255.0
+    crop_range = max(crop_hi - crop_lo, 1.0)
+    print(f"  Crop normalization: lo={crop_lo:.1f} (thresh)  hi={crop_hi:.1f}")
+
+    output_path = os.path.join(output_folder, f"particle_{particle_id}_pumping.mp4")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out    = cv2.VideoWriter(output_path, fourcc, fps, (output_width, output_height))
+
+    start_frame      = int(particle_df["frame"].min())
+    end_frame        = int(particle_df["frame"].max())
+    rolling_window_s = 5
+    trail_frames     = 60
+    plot_window_s    = 8   # seconds of history shown in intensity plot
+
+    # Smooth x/y positions for stable crop centering (rolling mean, ~0.5 s window)
+    smooth_win = max(3, int(frame_rate * 0.5))
+    particle_df = particle_df.copy()
+    particle_df["x_smooth"] = (particle_df["x"]
+                                .rolling(smooth_win, center=True, min_periods=1)
+                                .mean())
+    particle_df["y_smooth"] = (particle_df["y"]
+                                .rolling(smooth_win, center=True, min_periods=1)
+                                .mean())
+    # Fast lookup: frame → smoothed position
+    smooth_pos = {int(r["frame"]): (int(round(r["x_smooth"])), int(round(r["y_smooth"])))
+                  for _, r in particle_df.iterrows()}
+
+    # State preserved across dropped frames
+    last_x, last_y       = None, None
+    last_crop_bordered   = None   # pre-rendered crop+border image
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    frame_idx = start_frame
+
+    while frame_idx <= end_frame:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
+        canvas = np.zeros((output_height, output_width, 3), dtype=np.uint8)
+        canvas[:height, :width] = frame
+
+        # ── Rolling rate ──────────────────────────────────────────────────────
+        window_frames = int(rolling_window_s * frame_rate)
+        recent_pumps  = particle_pumps[
+            (particle_pumps["frame"] >= frame_idx - window_frames) &
+            (particle_pumps["frame"] <= frame_idx)
+        ]
+        rolling_rate = len(recent_pumps) / rolling_window_s
+        cum_pumps    = len(particle_pumps[particle_pumps["frame"] <= frame_idx])
+        trail_color  = _pump_rate_color(rolling_rate)
+
+        # ── Update position and crop when data exists this frame ──────────────
+        frame_data = particle_df[particle_df["frame"] == frame_idx]
+        if len(frame_data) > 0:
+            row = frame_data.iloc[0]
+            last_x, last_y = smooth_pos.get(frame_idx, (int(row["x"]), int(row["y"])))
+
+            xs = max(0, last_x - half);  xe = min(width,  last_x + half)
+            ys = max(0, last_y - half);  ye = min(height, last_y + half)
+            crop_gray = gray_frame[ys:ye, xs:xe]
+            if crop_gray.size > 0:
+                crop_clipped = np.clip(crop_gray.astype(np.float32), crop_lo, crop_hi)
+                crop_norm    = ((crop_clipped - crop_lo) / crop_range * 255).astype(np.uint8)
+                crop_bgr     = cv2.cvtColor(crop_norm, cv2.COLOR_GRAY2BGR)
+                crop_r       = cv2.resize(crop_bgr, (display_crop_size, display_crop_size))
+                last_crop_bordered = cv2.copyMakeBorder(
+                    crop_r, border, border, border, border,
+                    cv2.BORDER_CONSTANT, value=trail_color)
+
+        # ── Draw trail + crop using last known position (persists on drops) ───
+        if last_x is not None:
+            # Trail
+            past = particle_df[
+                (particle_df["frame"] <= frame_idx) &
+                (particle_df["frame"] >  frame_idx - trail_frames)
+            ]
+            if len(past) > 1:
+                pts = np.array([[int(r["x"]), int(r["y"])]
+                                for _, r in past.iterrows()], dtype=np.int32)
+                overlay = canvas[:height, :width].copy()
+                cv2.polylines(overlay, [pts], False, trail_color, 2)
+                canvas[:height, :width] = cv2.addWeighted(
+                    overlay, 0.6, canvas[:height, :width], 0.4, 0)
+
+            # Crop inset
+            if last_crop_bordered is not None:
+                ch, cw = last_crop_bordered.shape[:2]
+                canvas[0:ch, width:width + cw] = last_crop_bordered
+
+            # ── Info text ─────────────────────────────────────────────────────
+            ix  = width + 5
+            iy0 = display_crop_size + 2 * border + 18
+            cv2.putText(canvas, f"Particle {particle_id}",
+                        (ix, iy0), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+            cv2.putText(canvas, f"t = {frame_idx / frame_rate:.1f} s",
+                        (ix, iy0 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+            cv2.putText(canvas, f"Rate: {rolling_rate:.2f} Hz",
+                        (ix, iy0 + 46), cv2.FONT_HERSHEY_SIMPLEX, 0.5, trail_color, 1)
+            cv2.putText(canvas, f"Pumps: {cum_pumps}",
+                        (ix, iy0 + 70), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+            cv2.putText(canvas, f"({pump_method})",
+                        (ix, iy0 + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (130, 130, 130), 1)
+
+            # ── Intensity plot ────────────────────────────────────────────────
+            plot_win_frames = int(plot_window_s * frame_rate)
+            plot_start = frame_idx - plot_win_frames
+            plot_data  = particle_df[
+                (particle_df["frame"] >= plot_start) &
+                (particle_df["frame"] <= frame_idx)
+            ].sort_values("frame")
+
+            if len(plot_data) >= 2:
+                i_vals  = plot_data["mean_intensity"].tolist()
+                p_vals  = [f in pump_frames for f in plot_data["frame"]]
+                plot_y0 = display_crop_size + 2 * border + info_h
+                _draw_intensity_panel(
+                    canvas, width, plot_y0, panel_w, plot_h,
+                    i_vals, p_vals
+                )
+
+        out.write(canvas)
+        frame_idx += 1
+        if frame_idx % 10 == 0:
+            print(f"\rProcessing frame {frame_idx}/{end_frame}", end="", flush=True)
+
+    cap.release()
+    out.release()
+    print(f"\nPumping video saved to: {output_path}")
+    return output_path
+
+
+# # Usage:
+# best_particle = find_particle_with_all_behaviors(df_motion)
+
+# if best_particle is not None:
+#     video_folder = os.path.dirname(video_path)
+    
+#     output_video = create_annotated_video(
+#         video_path=video_path,
+#         df=df_motion,
+#         particle_id=best_particle,
+#         output_folder=video_folder,
+#         pixel_length=60,
+#         frame_rate=10,
+#         global_thresh=None,  # Will auto-detect using Otsu
+#         min_area=100,
+#         max_area=5000,
+#         illumination=0,      # 0 for worms lighter than background
+#         crop_size=150,
+#         show_mask=True
+#     )
