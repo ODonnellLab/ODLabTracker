@@ -1,16 +1,23 @@
-min_area: 150 #min area of worm in pixels
-max_area: 700 #max area of worm in pixels
-gap_range: 8 # max number of frame gap to link worms (i.e. can a worm disappear for more frames?)
+mode: pumping # analysis mode: postural (body movement states) or pumping (pharyngeal pumping)
+min_area: 50 #min area of worm in pixels
+max_area: 300 #max area of worm in pixels
+gap_range: 30 # max number of frame gap to link worms (i.e. can a worm disappear for more frames?)
 thresh: None # if not 'None', then manual threshold - set to a number (see below) to use if too few worms detected or too many short tracks
-search_range: 30 # max pixel distance to link tracks across frames
-min_length: 25 # minimum length of track in frames to keep
-frame_rate: 10 # FPS - necessary for speed analysis and video writing
+thresh_method: otsu # auto-threshold method when thresh=None: otsu (default), triangle (bright sparse on dark), yen (very bright sparse), li
+max_objects: 50 # maximum in-range objects per frame; threshold raised via binary search if exceeded (set to null to disable)
+
+### pumping mode parameters ###
+min_pump_track_frames: 20 # minimum track length for pumping analysis (1 sec at 20fps)
+peak_prominence: 10       # scipy find_peaks prominence threshold for pump detection
+search_range: 20 # max pixel distance to link tracks across frames
+min_length: 10 # minimum length of track in frames to keep
+frame_rate: 20 # FPS - necessary for speed analysis and video writing
 illumination: 0 # illumination source, 0 = white worms on dark (e.g. IR), 1 = dark worms on light. default 0
 subsample: 1 # frames to keep (1/n frames), will speed up analysis of videos with a high frame rate if using centroid tracking
 backsub: True # for IR illumination, this works much better
-backsub_frames: 20 # number of evenly-spaced frames to subtract background
-pixel_length: 60 # number of pixels/mm
-speed_threshold: 0.03 # minimum speed to be considered moving (mm/sec)
+backsub_frames: 10 # number of evenly-spaced frames to subtract background
+pixel_length: 116 # number of pixels/mm
+speed_threshold: 0.01 # minimum speed to be considered moving (mm/sec)
 min_displacement_for_angle: 0.001  # Ignore angle when moving < n mm between frames 
 
 ### these will not usually change ###

@@ -3,25 +3,21 @@
 
 import numpy as np
 import pandas as pd
-import ipyfilechooser
 import os
-import imageio
 import imageio.v3 as iio
 import tifffile
-from PIL import Image
 from skimage.color import rgb2gray
 import yaml
 import time
+import pickle
 
 import matplotlib as mpl
 import cv2
 import matplotlib.pyplot as plt
 
-from skimage import io, color, filters, morphology, measure
-from skimage.draw import rectangle_perimeter
+from skimage import filters, morphology, measure
 
 import trackpy as tp
-from scipy.ndimage import median_filter
 
 import ODLabTracker
 from ODLabTracker import tracking
@@ -32,12 +28,12 @@ import argparse
 
 class Colors:
     """ANSI color codes"""
-    RED    = '\033[91m'
-    GREEN  = '\033[92m'
-    BLUE   = '\033[94m'
+    RED     = '\033[91m'
+    GREEN   = '\033[92m'
+    BLUE    = '\033[94m'
     WARNING = '\033[93m'
-    PURPLE = '\033[0;35m'
-    ENDC   = '\033[0m'
+    PURPLE  = '\033[0;35m'
+    ENDC    = '\033[0m'
 
 
 def main(file_path, config_path, verbose=False):
@@ -53,47 +49,42 @@ def main(file_path, config_path, verbose=False):
     with open(config_path, 'r') as f:
         config_data = yaml.safe_load(f)
 
-    min_area      = config_data['min_area']
-    max_area      = config_data['max_area']
-    gap_range     = config_data['gap_range']
-    thresh        = None if config_data['thresh'] == 'None' else config_data['thresh']
-    thresh_method = config_data.get('thresh_method', 'otsu')
-    search_range  = config_data['search_range']
-    min_length    = config_data['min_length']
-    frame_rate    = config_data['frame_rate']
-    illumination  = config_data['illumination']
-    subsample     = config_data['subsample']
-    backsub       = config_data['backsub']
+    min_area       = config_data['min_area']
+    max_area       = config_data['max_area']
+    gap_range      = config_data['gap_range']
+    thresh         = None if config_data['thresh'] == 'None' else config_data['thresh']
+    thresh_method  = config_data.get('thresh_method', 'otsu')
+    search_range   = config_data['search_range']
+    min_length     = config_data['min_length']
+    frame_rate     = config_data['frame_rate']
+    illumination   = config_data['illumination']
+    subsample      = config_data['subsample']
+    backsub        = config_data['backsub']
     backsub_frames = config_data['backsub_frames']
-    pixel_length  = config_data['pixel_length']
-    speed_threshold = config_data['speed_threshold']
-    window_size   = config_data['window_size']
-    direction_threshold = config_data['direction_threshold']
-    min_run_length = config_data['min_run_length']
-    smooth_positions = config_data['smooth_positions']
-    smooth_window = config_data['smooth_window']
-    min_displacement_for_angle = config_data['min_displacement_for_angle']
-    reversal_persistence = config_data['reversal_persistence']
-    pirouette_speed_threshold = config_data['pirouette_speed_threshold']
-    pirouette_eccentricity_threshold = config_data['pirouette_eccentricity_threshold']
-    min_pirouette_duration = config_data['min_pirouette_duration']
-    max_instantaneous_speed = config_data['max_instantaneous_speed']
-    stability_threshold = config_data['stability_threshold']
-    max_objects   = config_data.get('max_objects', None)
+    pixel_length   = config_data['pixel_length']
+    max_objects    = config_data.get('max_objects', None)
 
-    print(f'{Colors.PURPLE}PARAMETER SETTINGS:{Colors.ENDC}')
-    print(f'minimum area of worm in pixels: {Colors.GREEN}{min_area}{Colors.ENDC}')
-    print(f'maximum area of worm in pixels: {Colors.GREEN}{max_area}{Colors.ENDC}')
-    print(f'gap range of worms in frames: {Colors.GREEN}{gap_range}{Colors.ENDC}')
+    # Pumping-specific params (with sensible defaults if absent from config)
+    min_pump_track_frames = config_data.get('min_pump_track_frames', frame_rate)  # 1 second
+    peak_prominence       = config_data.get('peak_prominence', 10)
+    stitch_gap_frames     = config_data.get('stitch_gap_frames', gap_range)
+    stitch_gap_pixels     = config_data.get('stitch_gap_pixels', search_range * 2)
+
+    print(f'{Colors.PURPLE}PARAMETER SETTINGS (pumping mode):{Colors.ENDC}')
+    print(f'minimum area in pixels: {Colors.GREEN}{min_area}{Colors.ENDC}')
+    print(f'maximum area in pixels: {Colors.GREEN}{max_area}{Colors.ENDC}')
+    print(f'gap range (frames): {Colors.GREEN}{gap_range}{Colors.ENDC}')
     if backsub:
         print(f'{Colors.GREEN}Subtracting background{Colors.ENDC}')
     if thresh is None:
         print(f'{Colors.GREEN}automatically calculating threshold{Colors.ENDC}')
     else:
         print(f'manual threshold: {Colors.GREEN}{thresh}{Colors.ENDC}')
-    print(f'maximum pixel distance to link worms: {Colors.GREEN}{search_range}{Colors.ENDC}')
-    print(f'minimum length of worm track to keep in frames: {Colors.GREEN}{min_length}{Colors.ENDC}')
-    print(f'frame rate to use for speed analysis: {Colors.GREEN}{frame_rate}{Colors.ENDC}')
+    print(f'search range: {Colors.GREEN}{search_range}{Colors.ENDC}')
+    print(f'min track length: {Colors.GREEN}{min_length}{Colors.ENDC} frames')
+    print(f'frame rate: {Colors.GREEN}{frame_rate}{Colors.ENDC} fps')
+    print(f'min track length for pumping analysis: {Colors.GREEN}{min_pump_track_frames}{Colors.ENDC} frames')
+    print(f'peak prominence threshold: {Colors.GREEN}{peak_prominence}{Colors.ENDC}')
     if illumination == 0:
         print(f'{Colors.GREEN}analyzing light worms on dark background{Colors.ENDC}')
     else:
@@ -102,19 +93,16 @@ def main(file_path, config_path, verbose=False):
         print(f"keeping one out of every {Colors.GREEN}{subsample}{Colors.ENDC} frames")
 
     print(f'selected image path: {file_path}')
-    filename = os.path.splitext(file_path)[0]
-    print(f'selected filename: {filename}')
 
     ####### 3. Load video ########
     TIFF_EXTENSIONS = {".tif", ".tiff"}
-    file_ext  = os.path.splitext(file_path)[1].lower()
+    file_ext   = os.path.splitext(file_path)[1].lower()
     iio_plugin = "tifffile" if file_ext in TIFF_EXTENSIONS else "pyav"
     print(f"Using imageio plugin: {iio_plugin}")
 
-    start_time = time.time()
     if iio_plugin == "tifffile":
-        tif_file   = tifffile.TiffFile(file_path)
-        num_frames = len(tif_file.pages)
+        tif_file    = tifffile.TiffFile(file_path)
+        num_frames  = len(tif_file.pages)
         first_frame = tif_file.pages[0].asarray()
         imiter_vid  = (page.asarray() for page in tif_file.pages)
         print(f"TIFF stack: {num_frames} frames, shape {first_frame.shape}, dtype {first_frame.dtype}")
@@ -126,12 +114,12 @@ def main(file_path, config_path, verbose=False):
         num_frames  = image_props.shape[0]
 
     if first_frame.ndim == 3 and first_frame.shape[-1] == 3:
-        print("\n!!!Video is RGB, need to convert to grayscale 8-bit - consider changing video output to this type ahead of time!!!\n")
+        print("\n!!!Video is RGB — will convert to grayscale 8-bit!!!\n")
 
     frames = []
 
     if subsample > 1:
-        print(f'Running tracking on {num_frames/subsample} frames from the original {num_frames} frames')
+        print(f'Running tracking on {num_frames / subsample:.0f} frames from the original {num_frames}')
     else:
         print(f'Running full tracking on {num_frames} frames')
 
@@ -187,7 +175,8 @@ def main(file_path, config_path, verbose=False):
         print("tracking video using manual threshold")
         global_thresh = thresh
 
-    detections = tracking.collect_detections(
+    # collect_detections_pumping stores pixel arrays alongside centroids
+    detections, raw_pixel_store = tracking.collect_detections_pumping(
         frames, global_thresh=global_thresh,
         min_area=min_area, max_area=max_area, illumination=illumination)
 
@@ -197,59 +186,66 @@ def main(file_path, config_path, verbose=False):
     print(f'removing tracks shorter than {min_length} frames')
     tracks = tracking.filter_short_tracks(tracks, min_length=min_length)
 
-    ####### 6. Postural analysis ########
-    print("calculating speed and movement states")
-
-    tracks = tracking.calculate_motion_parameters(
+    # Stitch broken track fragments back together
+    print(f"Stitching broken tracks (max_gap={stitch_gap_frames} frames, "
+          f"max_dist={stitch_gap_pixels} px)")
+    tracks, n_stitched = tracking.stitch_tracks(
         tracks,
-        pixel_length=pixel_length,
+        max_gap_frames=stitch_gap_frames,
+        max_gap_pixels=stitch_gap_pixels
+    )
+    if n_stitched > 0:
+        # Re-filter in case any remnant short fragments remain after stitching
+        tracks = tracking.filter_short_tracks(tracks, min_length=min_length)
+
+    # Remap pixel store to (particle, frame) keys and drop _det_id column
+    pixel_store = tracking.build_pixel_store_for_tracks(tracks, raw_pixel_store)
+
+    ####### 6. Pumping analysis ########
+    print("Detecting pumping events")
+    pump_events, pump_summary = tracking.analyze_pumping(
+        tracks,
         frame_rate=frame_rate,
-        window_size=window_size,
-        direction_threshold=direction_threshold,
-        speed_threshold=speed_threshold,
-        min_run_length=min_run_length,
-        smooth_window=smooth_window,
-        min_displacement_for_angle=min_displacement_for_angle,
-        pirouette_speed_threshold=pirouette_speed_threshold,
-        pirouette_eccentricity_threshold=pirouette_eccentricity_threshold,
-        min_pirouette_duration=min_pirouette_duration,
-        max_instantaneous_speed=max_instantaneous_speed,
-        stability_threshold=stability_threshold
+        min_track_frames=min_pump_track_frames,
+        peak_prominence=peak_prominence
     )
 
-    ####### 7. Annotated video ########
-    print("Finding particle with all behaviors for demonstration video")
-    best_particle = tracking.find_particle_with_all_behaviors(tracks)
+    if not pump_summary.empty:
+        print("\nPumping summary:")
+        print(pump_summary.to_string(index=False))
+
+    ####### 7. Pumping video ########
+    best_particle = tracking.find_best_pumping_particle(tracks, pump_summary)
 
     if best_particle is not None:
-        print(f"Creating annotated video for particle {best_particle}")
-        output_video = tracking.create_annotated_video(
+        print(f"Creating pumping video for particle {best_particle}")
+        output_video = tracking.create_pumping_video(
             video_path=file_path,
-            df=tracks,
+            tracks=tracks,
+            pump_events=pump_events,
             particle_id=best_particle,
             output_folder=result_path,
-            pixel_length=pixel_length,
             frame_rate=frame_rate,
             global_thresh=global_thresh,
             min_area=min_area,
             max_area=max_area,
             illumination=illumination,
-            crop_size=150,
-            show_mask=True
+            pump_method="scipy"
         )
-        print(f"Annotated video saved to {output_video}")
+        print(f"Pumping video saved to {output_video}")
     else:
-        print("No particle found with all three behaviors — skipping annotated video")
+        print("No suitable particle found for pumping video — skipping")
 
-    ####### 8. Summary ########
+    ####### 8. Summary plots ########
     counts = tracks.groupby("particle")["frame"].count()
     print('Mean track length is ', np.ceil(np.mean(counts) / 2), ' frames')
     print('Minimum track length is ', int(min(counts)))
     print('Maximum track length is ', int(max(counts)))
+
     plt.figure(figsize=(10, 8))
     binwidth = 25
     plt.hist(counts, bins=range(int(min(counts)), int(max(counts)) + binwidth, binwidth))
-    plt.xlabel("length of track in frames\nif too many short tracks, try increasing gap_range,\nor increase threshold if there are too many small objects")
+    plt.xlabel("length of track in frames")
     plt.ylabel("number of worm tracks")
     plt.title("histogram of worm track lengths")
     plt.show(block=False)
@@ -257,12 +253,29 @@ def main(file_path, config_path, verbose=False):
     print('plotting linked and filtered worm tracks')
     tracking.plot_trajectories(stack=first_frame, tracks=tracks, output_path=result_path)
 
+    ####### 9. Save outputs ########
     print(f'saving tracked centroids to {os.path.join(result_path, "tracks.csv")}')
     tracks.to_csv(os.path.join(result_path, "tracks.csv"), index=False)
 
+    if not pump_events.empty:
+        pump_events_path = os.path.join(result_path, "pumping_events.csv")
+        pump_events.to_csv(pump_events_path, index=False)
+        print(f"pumping events saved to {pump_events_path}")
+
+    if not pump_summary.empty:
+        pump_summary_path = os.path.join(result_path, "pumping_summary.csv")
+        pump_summary.to_csv(pump_summary_path, index=False)
+        print(f"pumping summary saved to {pump_summary_path}")
+
+    pixel_pkl_path = os.path.join(result_path, "pixel_data.pkl")
+    with open(pixel_pkl_path, "wb") as f:
+        pickle.dump(pixel_store, f)
+    print(f"per-ROI pixel arrays saved to {pixel_pkl_path}")
+    print(f"  Keys: (particle, frame)  Values: dict with 'intensities', 'mask', 'bbox'")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ODLabTracker — postural mode")
+    parser = argparse.ArgumentParser(description="ODLabTracker — pumping mode")
     parser.add_argument("-f", "--filename", help="Path to input video file")
     parser.add_argument("-c", "--config",   help="Configuration (yaml) file", required=True)
     parser.add_argument("-v", "--verbose",  action="store_true")

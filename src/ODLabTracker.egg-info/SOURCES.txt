@@ -1,5 +1,7 @@
 README.md
 pyproject.toml
+src/ODLabTracker/batchtools.py
+src/ODLabTracker/filePreprocess.py
 src/ODLabTracker/tracking.py
 src/ODLabTracker.egg-info/PKG-INFO
 src/ODLabTracker.egg-info/SOURCES.txt
