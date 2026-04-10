@@ -283,7 +283,7 @@ if __name__ == "__main__":
 
     if args.filename:
         print("batch (non-interactive) mode")
-        file_path = os.path.join(os.getcwd(), args.filename)
+        file_path = os.path.abspath(args.filename)
         print(f"Processing file: {file_path}")
     else:
         import tkinter as tk
@@ -293,5 +293,5 @@ if __name__ == "__main__":
         file_path = filedialog.askopenfilename(title="Select a Video File")
         root.destroy()
 
-    config_path = os.path.join(os.getcwd(), args.config)
+    config_path = os.path.abspath(args.config)
     main(file_path, config_path, verbose=args.verbose)

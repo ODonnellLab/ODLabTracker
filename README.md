@@ -193,13 +193,50 @@ Runs detection and linking on a short clip and plots the per-particle intensity 
 
 ## Batch and parallel processing
 
-```bash
-# Process a list of files sequentially
-python run_fasttrack_batch.py -c configs/your_config.yaml
+Two scripts are provided for running `track.py` on a folder of videos. Both search the target directory recursively for `.avi`, `.mp4`, `.tif`, and `.tiff` files.
 
-# Process multiple files in parallel
-python run_fasttrack_parallel.py -c configs/your_config.yaml
+### Sequential — `run_fasttrack_batch.py`
+
+Processes one file at a time and streams output live to the terminal.
+
+```bash
+python run_fasttrack_batch.py <directory> -c configs/your_config.yaml
 ```
+
+Use this when:
+- You want to watch progress in real time
+- RAM is limited
+- You need to Ctrl-C and resume without losing completed results
+
+### Parallel — `run_fasttrack_parallel.py`
+
+Processes N files simultaneously, each in its own subprocess.
+
+```bash
+python run_fasttrack_parallel.py <directory> -c configs/your_config.yaml -j 4
+```
+
+Output for each file is written to a log file in `logs/` so jobs don't interleave in the terminal. Monitor any individual job with:
+
+```bash
+tail -f logs/video_name.log
+```
+
+Completion status prints to the terminal as each job finishes.
+
+Use this when:
+- You have many files and want to use idle CPU cores
+- You are comfortable monitoring log files
+
+**Choosing `-j` (number of workers):** each tracking job loads the full video into RAM during processing. A rough guide:
+
+| RAM | Recommended `-j` |
+|-----|-----------------|
+| 16 GB | 2–4 |
+| 32 GB | 4–8 |
+| 64 GB+ | 8+ |
+
+Setting `-j` too high will cause the system to swap memory to disk, which is slower than running sequentially. When in doubt, start with `-j 2` and increase if memory stays comfortable.
 
 ---
 

@@ -1,132 +1,103 @@
 #!/usr/bin/env python3
 """
-Run FastTrack.py on all .avi files in parallel
-Usage: python run_fasttrack_parallel.py [parent_directory] -c [config_file] -j [num_jobs]
-Example: python run_fasttrack_parallel.py ./data -c configs/myconfig.txt -j 4
+Run track.py on all .avi/.tif files in a directory tree, N files at a time.
+
+Each file runs in its own subprocess. Output is streamed to per-file log files
+in a 'logs/' subfolder next to this script, so you can tail them independently.
+
+Usage:
+    python run_fasttrack_parallel.py <directory> -c <config.yaml>
+    python run_fasttrack_parallel.py ./data -c configs/IR_medium.yaml -j 4
+
+Notes:
+    - Default workers: 4, or number of files if fewer.
+    - Each tracking job loads the full video into RAM. Keep -j low enough
+      that total memory stays comfortable (rule of thumb: 2–4 jobs per 16 GB RAM).
+    - Progress of individual jobs can be monitored with:
+          tail -f logs/<filename>.log
 """
 
 import argparse
 import subprocess
 import sys
+import os
 from pathlib import Path
-from multiprocessing import Pool, cpu_count
-from functools import partial
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+VIDEO_EXTENSIONS = {".avi", ".mp4", ".tif", ".tiff"}
 
 
-def process_single_file(avi_file, config_file=None):
-    """Process a single .avi file with FastTrack.py"""
-    try:
-        # Build command with config file if provided
-        cmd = ["python", "FastTrack.py", "-f", str(avi_file)]
-        if config_file:
-            cmd.extend(["-c", config_file])
-        
-        # Run FastTrack.py with the file
+def run_one(video_path, config, log_dir):
+    """Run track.py on a single file, streaming output to a log file."""
+    log_path = Path(log_dir) / (Path(video_path).stem + ".log")
+    with open(log_path, "w") as log:
         result = subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
+            [sys.executable, "track.py", "-f", video_path, "-c", config],
+            stdout=log,
+            stderr=subprocess.STDOUT,
             text=True
         )
-        return {
-            'file': avi_file,
-            'success': True,
-            'output': result.stdout,
-            'error': None
-        }
-        
-    except subprocess.CalledProcessError as e:
-        return {
-            'file': avi_file,
-            'success': False,
-            'output': None,
-            'error': e.stderr
-        }
-    except FileNotFoundError:
-        return {
-            'file': avi_file,
-            'success': False,
-            'output': None,
-            'error': "FastTrack.py not found or python not in PATH"
-        }
+    return video_path, result.returncode, str(log_path)
 
 
-def find_and_process_avi_files(parent_dir=".", config_file=None, num_jobs=None):
-    """Find all .avi files and run FastTrack.py on each in parallel"""
-    parent_path = Path(parent_dir)
-    
-    # Find all .avi files recursively
-    avi_files = list(parent_path.rglob("*.avi"))
-    
-    if not avi_files:
-        print(f"No .avi files found in {parent_path}")
-        return
-    
-    # Determine number of parallel jobs
-    if num_jobs is None:
-        num_jobs = cpu_count()
-    
-    print(f"Found {len(avi_files)} .avi file(s)")
-    if config_file:
-        print(f"Using config file: {config_file}")
-    print(f"Running with {num_jobs} parallel jobs")
-    print("=" * 50)
-    
-    # Create a partial function with config_file bound
-    process_func = partial(process_single_file, config_file=config_file)
-    
-    # Process files in parallel
-    with Pool(processes=num_jobs) as pool:
-        results = pool.map(process_func, avi_files)
-    
-    # Print results
-    print("\n" + "=" * 50)
-    print("RESULTS:")
-    print("=" * 50)
-    
-    success_count = 0
-    error_count = 0
-    
-    for result in results:
-        if result['success']:
-            success_count += 1
-            print(f"✓ Success: {result['file'].name}")
-            if result['output']:
-                print(f"  Output: {result['output'].strip()}")
-        else:
-            error_count += 1
-            print(f"✗ Error: {result['file'].name}")
-            if result['error']:
-                print(f"  Error message: {result['error'].strip()}")
-    
-    print("\n" + "=" * 50)
-    print(f"Completed: {success_count} successful, {error_count} failed")
-    print("=" * 50)
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run track.py in parallel on all video files in a directory tree"
+    )
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=".",
+        help="Directory to search for video files (default: current directory)"
+    )
+    parser.add_argument("-c", "--config", required=True,
+                        help="Config YAML file to pass to track.py")
+    parser.add_argument("-j", "--jobs", type=int, default=4,
+                        help="Number of parallel workers (default: 4)")
+    args = parser.parse_args()
+
+    directory   = Path(os.path.abspath(args.directory))
+    config      = os.path.abspath(args.config)
+    video_files = sorted(
+        f for f in directory.rglob("*") if f.suffix.lower() in VIDEO_EXTENSIONS
+    )
+
+    if not video_files:
+        print(f"No video files found in {directory}")
+        sys.exit(0)
+
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+
+    n_workers = min(args.jobs, len(video_files))
+    print(f"Found {len(video_files)} file(s) — running {n_workers} at a time")
+    print(f"Config:  {config}")
+    print(f"Logs:    {log_dir.resolve()}/")
+    print(f"Monitor: tail -f logs/<name>.log")
+    print("-" * 60)
+
+    n_ok, n_err = 0, 0
+    futures = {}
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        for video in video_files:
+            f = pool.submit(run_one, str(video), config, str(log_dir))
+            futures[f] = video
+
+        for future in as_completed(futures):
+            video_path, returncode, log_path = future.result()
+            name = Path(video_path).name
+            if returncode == 0:
+                n_ok += 1
+                print(f"  OK      {name}")
+            else:
+                n_err += 1
+                print(f"  FAILED  {name}  (see {log_path})")
+
+    print("\n" + "=" * 60)
+    print(f"Done: {n_ok} succeeded, {n_err} failed")
+    if n_err:
+        print(f"Check logs/ for details on failed jobs.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Run FastTrack.py on all .avi files in parallel"
-    )
-    parser.add_argument(
-        "parent_directory",
-        nargs="?",
-        default=".",
-        help="Parent directory to search for .avi files (default: current directory)"
-    )
-    parser.add_argument(
-        "-c",
-        "--config",
-        dest="config_file",
-        help="Config file to pass to FastTrack.py (e.g., configs/myconfig.txt)"
-    )
-    parser.add_argument(
-        "-j",
-        "--jobs",
-        type=int,
-        dest="num_jobs",
-        help=f"Number of parallel jobs (default: number of CPU cores = {cpu_count()})"
-    )
-    
-    args = parser.parse_args()
-    find_and_process_avi_files(args.parent_directory, args.config_file, args.num_jobs)
+    main()
