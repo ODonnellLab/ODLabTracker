@@ -16,7 +16,7 @@ from readlif.reader import LifFile
 from tqdm import tqdm
 
 
-def lif_to_avi(lif_path, fps=20, quality=95):
+def lif_to_avi(lif_path, fps=20, quality=80):
     output_dir = os.path.splitext(lif_path)[0] + "_avi"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -38,21 +38,19 @@ def lif_to_avi(lif_path, fps=20, quality=95):
         h, w    = first.shape
         out_path = os.path.join(output_dir, f"{idx + 1:02d}_{name}.avi")
 
-        # Sample one random frame from the middle 80% of the series to estimate
-        # the actual data range.  Fluorescence data rarely uses the full bit-depth
-        # range, so mapping 0–4095→0–255 for 12-bit produces dim, low-contrast
-        # output.  A single mid-video frame avoids initiation artifacts at frame 0
-        # and matches what ImageJ's "Brightness/Contrast → Auto" does.
+        # Use frame 200 (or last frame if series is shorter) to estimate the
+        # contrast range.  global_max is 2x the 99.5th percentile of that frame
+        # to leave headroom for frames with increased fluorescence without clipping.
         bits      = lif_image.bit_depth[0]
-        sample_t  = int(np.random.randint(int(n_frames * 0.1), int(n_frames * 0.9)))
+        sample_t  = min(200, n_frames - 1)
         ref       = np.array(lif_image.get_frame(z=0, t=sample_t))
         if ref.ndim == 3:
             ref = ref.mean(axis=2)
         ref        = ref.astype(np.float32)
         global_min = float(np.percentile(ref, 0.5))
-        global_max = float(np.percentile(ref, 99.5))
+        global_max = float(np.percentile(ref, 99.5)) * 2.0
         print(f"  Bit depth: {bits}-bit  |  contrast range: {global_min:.0f}–{global_max:.0f}"
-              f"  (from frame {sample_t})")
+              f"  (frame {sample_t}, max x2 for fluorescence headroom)")
 
         def to_uint8(arr):
             arr = arr.astype(np.float32)
