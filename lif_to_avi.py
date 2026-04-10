@@ -58,8 +58,12 @@ def lif_to_avi(lif_path, fps=20, quality=75, black_level=10, top_scale=3.0):
             arr = (arr - global_min) / (global_max - global_min) * 255.0
             return np.clip(arr, 0, 255).astype(np.uint8)
 
+        # Write as color YCbCr JPEG (isColor=True) matching ImageJ's AVI export.
+        # isColor=False writes a grayscale-only JPEG that goes through a different
+        # ffmpeg decode path and uses different quantization tables, producing
+        # subtly different pixel values after the encode→decode round-trip.
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h), isColor=False)
+        writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h), isColor=True)
         writer.set(cv2.VIDEOWRITER_PROP_QUALITY, quality)
 
         for t in tqdm(range(n_frames), desc=name, unit="frame"):
@@ -74,7 +78,7 @@ def lif_to_avi(lif_path, fps=20, quality=75, black_level=10, top_scale=3.0):
             if frame.dtype != np.uint8:
                 frame = to_uint8(frame)
 
-            writer.write(frame)
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR))
 
         writer.release()
         size_mb = os.path.getsize(out_path) / 1e6
@@ -88,8 +92,8 @@ if __name__ == "__main__":
     parser.add_argument("lif_file", nargs="?", help="Path to .lif file")
     parser.add_argument("--fps",     type=float, default=20,
                         help="Output frame rate (default: 20)")
-    parser.add_argument("--quality",     type=int,   default=85,
-                        help="JPEG quality 0-100 (default: 85)")
+    parser.add_argument("--quality",     type=int,   default=75,
+                        help="JPEG quality 0-100 (default: 75)")
     parser.add_argument("--black-level", type=float, default=10,
                         help="Percentile of frame 200 clipped to black (default: 20)")
     parser.add_argument("--top-scale",   type=float, default=3.0,
