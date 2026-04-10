@@ -38,13 +38,21 @@ def lif_to_avi(lif_path, fps=20, quality=95):
         h, w    = first.shape
         out_path = os.path.join(output_dir, f"{idx + 1:02d}_{name}.avi")
 
-        # Determine global scale from LIF metadata bit depth so all frames
-        # share the same contrast mapping (per-frame normalize caused flickering).
-        # lif_image.bit_depth is a tuple of per-channel bit depths, e.g. (12,).
-        # This correctly distinguishes 12-bit-in-uint16 from true 16-bit.
-        bits = lif_image.bit_depth[0]
-        global_min, global_max = 0, (2 ** bits) - 1
-        print(f"  Bit depth: {bits}-bit  (scale range 0–{global_max})")
+        # Sample one random frame from the middle 80% of the series to estimate
+        # the actual data range.  Fluorescence data rarely uses the full bit-depth
+        # range, so mapping 0–4095→0–255 for 12-bit produces dim, low-contrast
+        # output.  A single mid-video frame avoids initiation artifacts at frame 0
+        # and matches what ImageJ's "Brightness/Contrast → Auto" does.
+        bits      = lif_image.bit_depth[0]
+        sample_t  = int(np.random.randint(int(n_frames * 0.1), int(n_frames * 0.9)))
+        ref       = np.array(lif_image.get_frame(z=0, t=sample_t))
+        if ref.ndim == 3:
+            ref = ref.mean(axis=2)
+        ref        = ref.astype(np.float32)
+        global_min = float(np.percentile(ref, 0.5))
+        global_max = float(np.percentile(ref, 99.5))
+        print(f"  Bit depth: {bits}-bit  |  contrast range: {global_min:.0f}–{global_max:.0f}"
+              f"  (from frame {sample_t})")
 
         def to_uint8(arr):
             arr = arr.astype(np.float32)
