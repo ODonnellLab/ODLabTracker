@@ -3,7 +3,7 @@ min_area: 50 #min area of worm in pixels
 max_area: 300 #max area of worm in pixels
 gap_range: 30 # max number of frame gap to link worms (i.e. can a worm disappear for more frames?)
 thresh: None # if not 'None', then manual threshold - set to a number (see below) to use if too few worms detected or too many short tracks
-thresh_method: otsu # auto-threshold method when thresh=None: otsu (default), triangle (bright sparse on dark), yen (very bright sparse), li
+thresh_method: triangle # auto-threshold method when thresh=None: otsu (default), triangle (bright sparse on dark), yen (very bright sparse), li
 max_objects: 50 # maximum in-range objects per frame; threshold raised via binary search if exceeded (set to null to disable)
 
 ### pumping mode parameters ###
