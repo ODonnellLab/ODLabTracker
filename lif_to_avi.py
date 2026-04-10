@@ -32,14 +32,24 @@ def lif_to_avi(lif_path, fps=20, quality=85):
         lif_image  = lif.get_image(idx)
         first      = np.array(lif_image.get_frame(z=0, t=0))
 
-        # Ensure 8-bit grayscale
-        if first.dtype != np.uint8:
-            first = cv2.normalize(first, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         if first.ndim == 3:
-            first = cv2.cvtColor(first, cv2.COLOR_RGB2GRAY)
+            first = first.mean(axis=2)
 
         h, w    = first.shape
         out_path = os.path.join(output_dir, f"{idx + 1:02d}_{name}.avi")
+
+        # Determine global scale from LIF metadata bit depth so all frames
+        # share the same contrast mapping (per-frame normalize caused flickering).
+        # lif_image.bit_depth is a tuple of per-channel bit depths, e.g. (12,).
+        # This correctly distinguishes 12-bit-in-uint16 from true 16-bit.
+        bits = lif_image.bit_depth[0]
+        global_min, global_max = 0, (2 ** bits) - 1
+        print(f"  Bit depth: {bits}-bit  (scale range 0–{global_max})")
+
+        def to_uint8(arr):
+            arr = arr.astype(np.float32)
+            arr = (arr - global_min) / (global_max - global_min) * 255.0
+            return np.clip(arr, 0, 255).astype(np.uint8)
 
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h), isColor=False)
@@ -52,10 +62,10 @@ def lif_to_avi(lif_path, fps=20, quality=85):
                 print(f"  Warning: skipping frame {t}: {e}")
                 continue
 
-            if frame.dtype != np.uint8:
-                frame = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             if frame.ndim == 3:
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+                frame = frame.mean(axis=2)
+            if frame.dtype != np.uint8:
+                frame = to_uint8(frame)
 
             writer.write(frame)
 
