@@ -106,12 +106,17 @@ def main(file_path, config_path, verbose=False):
         imiter_vid  = (page.asarray() for page in tif_file.pages)
         print(f"TIFF stack: {num_frames} frames, shape {first_frame.shape}, dtype {first_frame.dtype}")
     else:
-        # Use imageio ffmpeg plugin (from imageio-ffmpeg dep) — cross-platform,
-        # bundles its own ffmpeg binary, no av/pyav needed.
-        first_frame = iio.imread(file_path, index=0, plugin="ffmpeg")
-        imiter_vid  = iio.imiter(file_path, plugin="ffmpeg")
-        image_props = iio.improps(file_path, plugin="ffmpeg")
-        num_frames  = image_props.shape[0]
+        # imageio v2 + format="ffmpeg" uses imageio-ffmpeg (declared dep),
+        # which bundles its own ffmpeg binary — cross-platform, no av/pyav needed.
+        import imageio.v2 as _iio2
+        _reader     = _iio2.get_reader(file_path, format="ffmpeg")
+        _meta       = _reader.get_meta_data()
+        _nframes    = _meta.get("nframes")
+        num_frames  = (int(_nframes) if (_nframes and _nframes != float("inf"))
+                       else int(round(_meta.get("fps", 20) * _meta.get("duration", 0))))
+        first_frame = np.array(_reader.get_data(0))
+        _reader.close()
+        imiter_vid  = _iio2.get_reader(file_path, format="ffmpeg")
         print(f"Video: {num_frames} frames, shape {first_frame.shape}, dtype {first_frame.dtype}")
 
     if first_frame.ndim == 3 and first_frame.shape[-1] == 3:
@@ -143,6 +148,8 @@ def main(file_path, config_path, verbose=False):
                     frame = frame.astype(np.uint8)
                 frames.append(frame)
 
+        if hasattr(imiter_vid, "close"):
+            imiter_vid.close()
         end_time = time.time()
         print(f"  Reading in {len(frames)} frames took {end_time - start_time:.1f} seconds")
 
