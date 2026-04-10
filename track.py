@@ -20,7 +20,7 @@ import yaml
 
 def get_file_path(filename_arg):
     if filename_arg:
-        return os.path.join(os.getcwd(), filename_arg)
+        return os.path.abspath(filename_arg)
     import tkinter as tk
     from tkinter import filedialog
     root = tk.Tk()
@@ -40,7 +40,7 @@ def main():
     parser.add_argument("-v", "--verbose",  action="store_true")
     args = parser.parse_args()
 
-    config_path = os.path.join(os.getcwd(), args.config)
+    config_path = os.path.abspath(args.config)
     with open(config_path, 'r') as f:
         config_data = yaml.safe_load(f)
 
