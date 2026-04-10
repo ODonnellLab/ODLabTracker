@@ -160,6 +160,9 @@ def main(file_path, config_path, verbose=False):
         print(f"  Reading in {len(frames)} frames took {end_time - start_time:.1f} seconds")
 
     first_frame = frames[0]
+    print(f"  [diag] raw frame[0]: dtype={first_frame.dtype}  "
+          f"min={first_frame.min()}  max={first_frame.max()}  "
+          f"mean={first_frame.mean():.1f}")
 
     ####### 4. Background subtraction ########
     if backsub:
@@ -171,6 +174,8 @@ def main(file_path, config_path, verbose=False):
             frame_to_add = tracking.convert_8bit(frames[i])
             backsub_frame += frame_to_add.astype(np.float32)
         average_frame = (backsub_frame / backsub_frames).astype(np.uint8)
+        print(f"  [diag] average_frame: min={average_frame.min()}  "
+              f"max={average_frame.max()}  mean={average_frame.mean():.1f}")
         plt.figure()
         plt.imshow(average_frame, cmap="gray")
         plt.show(block=False)
@@ -179,6 +184,8 @@ def main(file_path, config_path, verbose=False):
                       for f in frames]
         frames = subtracted
         first_frame = subtracted[0]
+        print(f"  [diag] subtracted frame[0]: min={first_frame.min()}  "
+              f"max={first_frame.max()}  mean={first_frame.mean():.1f}")
 
     ####### 5. Tracking ########
     print(f"Tracking and linking objects from {len(frames)} frames")
