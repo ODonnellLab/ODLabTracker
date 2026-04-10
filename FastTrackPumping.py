@@ -96,22 +96,24 @@ def main(file_path, config_path, verbose=False):
 
     ####### 3. Load video ########
     TIFF_EXTENSIONS = {".tif", ".tiff"}
-    file_ext   = os.path.splitext(file_path)[1].lower()
-    iio_plugin = "tifffile" if file_ext in TIFF_EXTENSIONS else "pyav"
-    print(f"Using imageio plugin: {iio_plugin}")
+    file_ext = os.path.splitext(file_path)[1].lower()
+    is_tiff  = file_ext in TIFF_EXTENSIONS
 
-    if iio_plugin == "tifffile":
+    if is_tiff:
         tif_file    = tifffile.TiffFile(file_path)
         num_frames  = len(tif_file.pages)
         first_frame = tif_file.pages[0].asarray()
         imiter_vid  = (page.asarray() for page in tif_file.pages)
         print(f"TIFF stack: {num_frames} frames, shape {first_frame.shape}, dtype {first_frame.dtype}")
     else:
-        first_frame = iio.imread(file_path, index=0, plugin=iio_plugin)
-        imiter_vid  = iio.imiter(file_path, plugin=iio_plugin)
-        image_props = iio.improps(file_path, plugin=iio_plugin)
-        print(image_props)
-        num_frames  = image_props.shape[0]
+        cap        = cv2.VideoCapture(file_path)
+        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        ret, bgr   = cap.read()
+        if not ret:
+            raise RuntimeError(f"cv2 could not read {file_path}")
+        first_frame = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        cap.release()
+        print(f"Video: {num_frames} frames, shape {first_frame.shape}, dtype {first_frame.dtype}")
 
     if first_frame.ndim == 3 and first_frame.shape[-1] == 3:
         print("\n!!!Video is RGB — will convert to grayscale 8-bit!!!\n")
@@ -125,7 +127,19 @@ def main(file_path, config_path, verbose=False):
 
     with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
         start_time = time.time()
-        for i, frame in enumerate(imiter_vid):
+        if is_tiff:
+            frame_iter = enumerate(imiter_vid)
+        else:
+            cap = cv2.VideoCapture(file_path)
+            def _cv2_iter(cap):
+                while True:
+                    ret, bgr = cap.read()
+                    if not ret:
+                        break
+                    yield cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            frame_iter = enumerate(_cv2_iter(cap))
+
+        for i, frame in frame_iter:
             if i % subsample == 0:
                 print(f"\rKeeping frame: {i}", end="", flush=True)
                 time.sleep(0.001)
@@ -139,6 +153,9 @@ def main(file_path, config_path, verbose=False):
                         print("already grayscale, converting to 8-bit")
                     frame = frame.astype(np.uint8)
                 frames.append(frame)
+
+        if not is_tiff:
+            cap.release()
         end_time = time.time()
         print(f"  Reading in {len(frames)} frames took {end_time - start_time:.1f} seconds")
 
