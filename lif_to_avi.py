@@ -16,7 +16,7 @@ from readlif.reader import LifFile
 from tqdm import tqdm
 
 
-def lif_to_avi(lif_path, fps=20, quality=85, black_level=20, top_scale=3.0):
+def lif_to_avi(lif_path, fps=20, quality=75, black_level=10, top_scale=3.0):
     output_dir = os.path.splitext(lif_path)[0] + "_avi"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -90,7 +90,7 @@ if __name__ == "__main__":
                         help="Output frame rate (default: 20)")
     parser.add_argument("--quality",     type=int,   default=85,
                         help="JPEG quality 0-100 (default: 85)")
-    parser.add_argument("--black-level", type=float, default=20,
+    parser.add_argument("--black-level", type=float, default=10,
                         help="Percentile of frame 200 clipped to black (default: 20)")
     parser.add_argument("--top-scale",   type=float, default=3.0,
                         help="Multiplier on 99.5th percentile for white point (default: 3.0)")
