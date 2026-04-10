@@ -16,7 +16,7 @@ from readlif.reader import LifFile
 from tqdm import tqdm
 
 
-def lif_to_avi(lif_path, fps=20, quality=85):
+def lif_to_avi(lif_path, fps=20, quality=95):
     output_dir = os.path.splitext(lif_path)[0] + "_avi"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -81,8 +81,8 @@ if __name__ == "__main__":
     parser.add_argument("lif_file", nargs="?", help="Path to .lif file")
     parser.add_argument("--fps",     type=float, default=20,
                         help="Output frame rate (default: 20)")
-    parser.add_argument("--quality", type=int,   default=85,
-                        help="JPEG quality 0-100 (default: 85)")
+    parser.add_argument("--quality", type=int,   default=95,
+                        help="JPEG quality 0-100 (default: 95)")
     args = parser.parse_args()
 
     if args.lif_file:
