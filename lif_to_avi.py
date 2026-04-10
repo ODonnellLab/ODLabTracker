@@ -16,7 +16,7 @@ from readlif.reader import LifFile
 from tqdm import tqdm
 
 
-def lif_to_avi(lif_path, fps=20, quality=85, black_level=10):
+def lif_to_avi(lif_path, fps=20, quality=85, black_level=20, top_scale=3.0):
     output_dir = os.path.splitext(lif_path)[0] + "_avi"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -40,8 +40,8 @@ def lif_to_avi(lif_path, fps=20, quality=85, black_level=10):
 
         # Use frame 200 (or last frame if series is shorter) to estimate the
         # contrast range.  global_min clips background to black (controlled by
-        # --black-level percentile).  global_max is 2x the 99.5th percentile
-        # to leave headroom for frames with increased fluorescence.
+        # --black-level percentile).  global_max is top_scale x the 99.5th
+        # percentile to leave headroom for brighter frames without saturation.
         bits      = lif_image.bit_depth[0]
         sample_t  = min(200, n_frames - 1)
         ref       = np.array(lif_image.get_frame(z=0, t=sample_t))
@@ -49,9 +49,9 @@ def lif_to_avi(lif_path, fps=20, quality=85, black_level=10):
             ref = ref.mean(axis=2)
         ref        = ref.astype(np.float32)
         global_min = float(np.percentile(ref, black_level))
-        global_max = float(np.percentile(ref, 99.5)) * 2.0
+        global_max = float(np.percentile(ref, 99.5)) * top_scale
         print(f"  Bit depth: {bits}-bit  |  contrast range: {global_min:.0f}–{global_max:.0f}"
-              f"  (frame {sample_t}, black_level={black_level}th pct, max x2)")
+              f"  (frame {sample_t}, black={black_level}th pct, top={top_scale}x)")
 
         def to_uint8(arr):
             arr = arr.astype(np.float32)
@@ -90,8 +90,10 @@ if __name__ == "__main__":
                         help="Output frame rate (default: 20)")
     parser.add_argument("--quality",     type=int,   default=85,
                         help="JPEG quality 0-100 (default: 85)")
-    parser.add_argument("--black-level", type=float, default=10,
-                        help="Percentile of frame 200 used as black point (default: 5)")
+    parser.add_argument("--black-level", type=float, default=20,
+                        help="Percentile of frame 200 clipped to black (default: 20)")
+    parser.add_argument("--top-scale",   type=float, default=3.0,
+                        help="Multiplier on 99.5th percentile for white point (default: 3.0)")
     args = parser.parse_args()
 
     if args.lif_file:
@@ -115,4 +117,4 @@ if __name__ == "__main__":
         sys.exit(1)
 
     lif_to_avi(lif_path, fps=args.fps, quality=args.quality,
-               black_level=args.black_level)
+               black_level=args.black_level, top_scale=args.top_scale)
