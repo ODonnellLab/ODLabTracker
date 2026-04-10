@@ -66,7 +66,14 @@ def preprocess_frame(img, min_area, max_area, thresh, illumination, thresh_metho
     # Use provided threshold or compute new one
     if thresh is None:
         method_fn = THRESH_METHODS.get(thresh_method, filters.threshold_otsu)
-        thresh = method_fn(gray)
+        # Post-backsub images are ~99% zero: Otsu on the full image always
+        # picks 0 because the zero-spike dominates.  Computing on non-zero
+        # pixels only gives a real bimodal distribution (noise vs. object).
+        zero_frac = np.mean(gray == 0)
+        if zero_frac > 0.9 and np.any(gray > 0):
+            thresh = float(method_fn(gray[gray > 0]))
+        else:
+            thresh = float(method_fn(gray))
         print(f'auto threshold ({thresh_method}): {thresh:.1f}', end='')
 
         # Binary search upward if too many objects detected
