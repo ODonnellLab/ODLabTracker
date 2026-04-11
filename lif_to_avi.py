@@ -16,7 +16,7 @@ from readlif.reader import LifFile
 from tqdm import tqdm
 
 
-def lif_to_avi(lif_path, fps=20, quality=85):
+def lif_to_avi(lif_path, fps=20, quality=75, black_level=10, top_scale=3.0):
     output_dir = os.path.splitext(lif_path)[0] + "_avi"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -38,21 +38,32 @@ def lif_to_avi(lif_path, fps=20, quality=85):
         h, w    = first.shape
         out_path = os.path.join(output_dir, f"{idx + 1:02d}_{name}.avi")
 
-        # Determine global scale from LIF metadata bit depth so all frames
-        # share the same contrast mapping (per-frame normalize caused flickering).
-        # lif_image.bit_depth is a tuple of per-channel bit depths, e.g. (12,).
-        # This correctly distinguishes 12-bit-in-uint16 from true 16-bit.
-        bits = lif_image.bit_depth[0]
-        global_min, global_max = 0, (2 ** bits) - 1
-        print(f"  Bit depth: {bits}-bit  (scale range 0–{global_max})")
+        # Use frame 200 (or last frame if series is shorter) to estimate the
+        # contrast range.  global_min clips background to black (controlled by
+        # --black-level percentile).  global_max is top_scale x the 99.5th
+        # percentile to leave headroom for brighter frames without saturation.
+        bits      = lif_image.bit_depth[0]
+        sample_t  = min(200, n_frames - 1)
+        ref       = np.array(lif_image.get_frame(z=0, t=sample_t))
+        if ref.ndim == 3:
+            ref = ref.mean(axis=2)
+        ref        = ref.astype(np.float32)
+        global_min = float(np.percentile(ref, black_level))
+        global_max = float(np.percentile(ref, 99.5)) * top_scale
+        print(f"  Bit depth: {bits}-bit  |  contrast range: {global_min:.0f}–{global_max:.0f}"
+              f"  (frame {sample_t}, black={black_level}th pct, top={top_scale}x)")
 
         def to_uint8(arr):
             arr = arr.astype(np.float32)
             arr = (arr - global_min) / (global_max - global_min) * 255.0
             return np.clip(arr, 0, 255).astype(np.uint8)
 
+        # Write as color YCbCr JPEG (isColor=True) matching ImageJ's AVI export.
+        # isColor=False writes a grayscale-only JPEG that goes through a different
+        # ffmpeg decode path and uses different quantization tables, producing
+        # subtly different pixel values after the encode→decode round-trip.
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h), isColor=False)
+        writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h), isColor=True)
         writer.set(cv2.VIDEOWRITER_PROP_QUALITY, quality)
 
         for t in tqdm(range(n_frames), desc=name, unit="frame"):
@@ -67,7 +78,7 @@ def lif_to_avi(lif_path, fps=20, quality=85):
             if frame.dtype != np.uint8:
                 frame = to_uint8(frame)
 
-            writer.write(frame)
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR))
 
         writer.release()
         size_mb = os.path.getsize(out_path) / 1e6
@@ -81,8 +92,12 @@ if __name__ == "__main__":
     parser.add_argument("lif_file", nargs="?", help="Path to .lif file")
     parser.add_argument("--fps",     type=float, default=20,
                         help="Output frame rate (default: 20)")
-    parser.add_argument("--quality", type=int,   default=85,
-                        help="JPEG quality 0-100 (default: 85)")
+    parser.add_argument("--quality",     type=int,   default=75,
+                        help="JPEG quality 0-100 (default: 75)")
+    parser.add_argument("--black-level", type=float, default=10,
+                        help="Percentile of frame 200 clipped to black (default: 20)")
+    parser.add_argument("--top-scale",   type=float, default=3.0,
+                        help="Multiplier on 99.5th percentile for white point (default: 3.0)")
     args = parser.parse_args()
 
     if args.lif_file:
@@ -105,4 +120,5 @@ if __name__ == "__main__":
         print(f"File not found: {lif_path}")
         sys.exit(1)
 
-    lif_to_avi(lif_path, fps=args.fps, quality=args.quality)
+    lif_to_avi(lif_path, fps=args.fps, quality=args.quality,
+               black_level=args.black_level, top_scale=args.top_scale)

@@ -66,8 +66,18 @@ def preprocess_frame(img, min_area, max_area, thresh, illumination, thresh_metho
     # Use provided threshold or compute new one
     if thresh is None:
         method_fn = THRESH_METHODS.get(thresh_method, filters.threshold_otsu)
-        thresh = method_fn(gray)
-        print(f'auto threshold ({thresh_method}): {thresh:.1f}', end='')
+        # Post-backsub images have an L-shaped histogram: peak of JPEG-noise pixels
+        # at 1-3 counts, long tail of worm-signal pixels at higher values.
+        # Otsu assumes similarly-sized classes and always lands at 2.
+        # Triangle finds max distance from histogram peak to tail end, which
+        # reliably separates noise from signal.  median==0 detects the sparse
+        # post-backsub case more robustly than a fixed zero-fraction cutoff.
+        if np.median(gray) == 0 and np.any(gray > 0):
+            thresh = float(filters.threshold_triangle(gray))
+            print(f'auto threshold (triangle/sparse): {thresh:.1f}', end='')
+        else:
+            thresh = float(method_fn(gray))
+            print(f'auto threshold ({thresh_method}): {thresh:.1f}', end='')
 
         # Binary search upward if too many objects detected
         if max_objects is not None:

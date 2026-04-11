@@ -4,7 +4,6 @@
 import numpy as np
 import pandas as pd
 import os
-import imageio.v3 as iio
 import tifffile
 from skimage.color import rgb2gray
 import yaml
@@ -106,17 +105,16 @@ def main(file_path, config_path, verbose=False):
         imiter_vid  = (page.asarray() for page in tif_file.pages)
         print(f"TIFF stack: {num_frames} frames, shape {first_frame.shape}, dtype {first_frame.dtype}")
     else:
+        # cv2.VideoCapture reads MJPEG frames as BGR and extracts the Y channel
+        # directly via COLOR_BGR2GRAY — immune to chroma channel values (Cb/Cr),
+        # unlike rgb2gray which weights channels and is sensitive to non-neutral chroma.
         cap        = cv2.VideoCapture(file_path)
         num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        ret, bgr   = cap.read()
-        if not ret:
-            raise RuntimeError(f"cv2 could not read {file_path}")
-        first_frame = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        cap.release()
+        ret, _bgr  = cap.read()
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        first_frame = cv2.cvtColor(_bgr, cv2.COLOR_BGR2GRAY) if ret else None
+        imiter_vid  = cap
         print(f"Video: {num_frames} frames, shape {first_frame.shape}, dtype {first_frame.dtype}")
-
-    if first_frame.ndim == 3 and first_frame.shape[-1] == 3:
-        print("\n!!!Video is RGB — will convert to grayscale 8-bit!!!\n")
 
     frames = []
 
@@ -127,35 +125,31 @@ def main(file_path, config_path, verbose=False):
 
     with np.errstate(invalid='ignore', divide='ignore', over='ignore'):
         start_time = time.time()
+
         if is_tiff:
-            frame_iter = enumerate(imiter_vid)
+            for i, frame in enumerate(imiter_vid):
+                if i % subsample == 0:
+                    print(f"\rKeeping frame: {i}", end="", flush=True)
+                    time.sleep(0.001)
+                    if frame.ndim == 3 and frame.shape[-1] == 3:
+                        frame = rgb2gray(frame)
+                        frame = (frame * 255).astype(np.uint8)
+                    else:
+                        frame = frame.astype(np.uint8)
+                    frames.append(frame)
         else:
-            cap = cv2.VideoCapture(file_path)
-            def _cv2_iter(cap):
-                while True:
-                    ret, bgr = cap.read()
-                    if not ret:
-                        break
-                    yield cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            frame_iter = enumerate(_cv2_iter(cap))
+            i = 0
+            while True:
+                ret, bgr = imiter_vid.read()
+                if not ret:
+                    break
+                if i % subsample == 0:
+                    print(f"\rKeeping frame: {i}", end="", flush=True)
+                    time.sleep(0.001)
+                    frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+                i += 1
+            imiter_vid.release()
 
-        for i, frame in frame_iter:
-            if i % subsample == 0:
-                print(f"\rKeeping frame: {i}", end="", flush=True)
-                time.sleep(0.001)
-                if frame.ndim == 3 and frame.shape[-1] == 3:
-                    if i / subsample == 1:
-                        print(" converting to grayscale images")
-                    frame = rgb2gray(frame)
-                    frame = (frame * 255).astype(np.uint8)
-                elif frame.ndim == 2:
-                    if i / subsample == 1:
-                        print("already grayscale, converting to 8-bit")
-                    frame = frame.astype(np.uint8)
-                frames.append(frame)
-
-        if not is_tiff:
-            cap.release()
         end_time = time.time()
         print(f"  Reading in {len(frames)} frames took {end_time - start_time:.1f} seconds")
 
@@ -180,7 +174,7 @@ def main(file_path, config_path, verbose=False):
         plt.imshow(average_frame, cmap="gray")
         plt.show(block=False)
 
-        subtracted = [tracking.subtract_background(f, average_frame=average_frame)
+        subtracted = [tracking.subtract_background(f, average_frame=average_frame, normalize=False)
                       for f in frames]
         frames = subtracted
         first_frame = subtracted[0]
