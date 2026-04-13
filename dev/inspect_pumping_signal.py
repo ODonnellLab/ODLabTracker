@@ -17,7 +17,7 @@ import yaml
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import imageio.v3 as iio
+import cv2
 import tifffile
 from skimage.color import rgb2gray
 from scipy.signal import find_peaks
@@ -54,34 +54,38 @@ peak_prominence = cfg.get('peak_prominence', 10)
 max_frames     = args.max_frames
 
 # ── Read frames ────────────────────────────────────────────────────────────────
-file_ext   = os.path.splitext(args.filename)[1].lower()
-iio_plugin = "tifffile" if file_ext in {'.tif', '.tiff'} else "pyav"
+file_ext = os.path.splitext(args.filename)[1].lower()
+is_tiff  = file_ext in {'.tif', '.tiff'}
 
-print(f"Reading up to {max_frames} frames using {iio_plugin}...")
-
-if iio_plugin == "tifffile":
-    tif_file   = tifffile.TiffFile(args.filename)
-    total      = len(tif_file.pages)
-    n          = min(max_frames, total)
-    frames_raw = [tif_file.pages[i].asarray() for i in range(n)]
-else:
-    frames_raw = []
-    for i, frame in enumerate(iio.imiter(args.filename, plugin=iio_plugin)):
-        if i >= max_frames:
-            break
-        frames_raw.append(frame)
+print(f"Reading up to {max_frames} frames...")
 
 frames = []
-for frame in frames_raw:
-    if frame.ndim == 3 and frame.shape[-1] == 3:
-        frame = (rgb2gray(frame) * 255).astype(np.uint8)
-    else:
-        frame = frame.astype(np.uint8)
-    frames.append(frame)
+if is_tiff:
+    tif_file = tifffile.TiffFile(args.filename)
+    for i, page in enumerate(tif_file.pages):
+        if i >= max_frames:
+            break
+        frame = page.asarray()
+        if frame.ndim == 3 and frame.shape[-1] == 3:
+            frame = (rgb2gray(frame) * 255).astype(np.uint8)
+        else:
+            frame = frame.astype(np.uint8)
+        frames.append(frame)
+else:
+    cap = cv2.VideoCapture(args.filename)
+    i = 0
+    while i < max_frames:
+        ret, bgr = cap.read()
+        if not ret:
+            break
+        frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+        i += 1
+    cap.release()
 
 print(f"Loaded {len(frames)} frames, shape {frames[0].shape}")
 
 # ── Background subtraction ─────────────────────────────────────────────────────
+raw_frames = frames  # keep pre-subtraction copy for intensity measurement
 if backsub:
     print(f"Applying background subtraction ({backsub_frames} frames)...")
     frame_indices = np.linspace(1, len(frames) - 1, backsub_frames, dtype=int)
@@ -89,7 +93,7 @@ if backsub:
     for i in frame_indices:
         avg += frames[i].astype(np.float32)
     average_frame = (avg / backsub_frames).astype(np.uint8)
-    frames = [tracking.subtract_background(f, average_frame) for f in frames]
+    frames = [tracking.subtract_background(f, average_frame, normalize=False) for f in frames]
     print(f"Background subtracted. Frame[0] stats: min={frames[0].min()}, max={frames[0].max()}, mean={frames[0].mean():.1f}")
 
 # ── Threshold ──────────────────────────────────────────────────────────────────
@@ -107,7 +111,8 @@ else:
 print("Running detection and linking...")
 detections, _ = tracking.collect_detections_pumping(
     frames, global_thresh=global_thresh,
-    min_area=min_area, max_area=max_area, illumination=illumination)
+    min_area=min_area, max_area=max_area, illumination=illumination,
+    raw_stack=raw_frames if backsub else None)
 
 tracks = tracking.link_tracks(detections, search_range=search_range,
                                memory=gap_range, quiet=True)
