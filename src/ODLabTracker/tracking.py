@@ -1475,7 +1475,9 @@ def analyze_pumping(tracks, frame_rate, min_track_frames=None, peak_prominence=1
         # noise that can create spurious local maxima when pyampd detrends.
         # scipy uses the raw signal — prominence already rejects noise spikes
         # and smoothing at fast pump rates (>3 Hz at 20fps) merges real peaks.
-        smoothed = uniform_filter1d(intensity.astype(float), size=3)
+        # Window=2 is the minimum that kills single-frame spikes; window=3
+        # collapses peaks at ~5 Hz (every 4 frames at 20fps) for weak signals.
+        smoothed = uniform_filter1d(intensity.astype(float), size=2)
 
         # ── scipy ──────────────────────────────────────────────────────────────
         scipy_idx, _ = find_peaks(intensity.astype(float), prominence=peak_prominence)

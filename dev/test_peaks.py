@@ -23,8 +23,8 @@ parser.add_argument("--signal",           default="mean_intensity",
                     help="Which intensity column to use (default: mean_intensity)")
 parser.add_argument("--fps",             type=float, default=20.0,
                     help="Frame rate in Hz (default: 20)")
-parser.add_argument("--smooth",          type=int,   default=3,
-                    help="Uniform-filter window size for AMPD (1 = no smoothing, default: 3)")
+parser.add_argument("--smooth",          type=int,   default=2,
+                    help="Uniform-filter window size for AMPD (1 = no smoothing, default: 2)")
 parser.add_argument("--prominence",      type=float, default=10,
                     help="scipy find_peaks prominence threshold (default: 10)")
 args = parser.parse_args()
