@@ -1,5 +1,5 @@
 mode: pumping # analysis mode: postural (body movement states) or pumping (pharyngeal pumping)
-min_area: 50 #min area of worm in pixels
+min_area: 30 #min area of worm in pixels
 max_area: 300 #max area of worm in pixels
 gap_range: 30 # max number of frame gap to link worms (i.e. can a worm disappear for more frames?)
 thresh: None # if not 'None', then manual threshold - set to a number (see below) to use if too few worms detected or too many short tracks
