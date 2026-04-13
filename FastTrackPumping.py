@@ -159,6 +159,7 @@ def main(file_path, config_path, verbose=False):
           f"mean={first_frame.mean():.1f}")
 
     ####### 4. Background subtraction ########
+    raw_frames = frames  # always keep a reference to the pre-subtraction frames
     if backsub:
         print("Subtracting background")
         backsub_frame = np.zeros_like(first_frame, dtype=np.float32)
@@ -193,10 +194,12 @@ def main(file_path, config_path, verbose=False):
         print("tracking video using manual threshold")
         global_thresh = thresh
 
-    # collect_detections_pumping stores pixel arrays alongside centroids
+    # collect_detections_pumping uses background-subtracted frames for detection
+    # but measures intensity from raw frames to avoid normalization artifacts.
     detections, raw_pixel_store = tracking.collect_detections_pumping(
         frames, global_thresh=global_thresh,
-        min_area=min_area, max_area=max_area, illumination=illumination)
+        min_area=min_area, max_area=max_area, illumination=illumination,
+        raw_stack=raw_frames if backsub else None)
 
     tracks = tracking.link_tracks(detections, search_range=search_range,
                                   memory=gap_range, quiet=True)

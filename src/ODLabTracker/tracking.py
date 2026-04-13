@@ -1344,8 +1344,26 @@ def find_particle_with_all_behaviors(df):
 
 # ── Pumping analysis functions ────────────────────────────────────────────────
 
-def collect_detections_pumping(stack, global_thresh, min_area, max_area, illumination=0):
+def collect_detections_pumping(stack, global_thresh, min_area, max_area, illumination=0,
+                               raw_stack=None):
     """Like collect_detections but also stores per-ROI pixel arrays for pharynx reconstruction.
+
+    Parameters
+    ----------
+    stack : list of np.ndarray
+        Background-subtracted frames used for thresholding and detection.
+    global_thresh : float
+        Fixed threshold applied to every frame.
+    min_area, max_area : int
+        ROI area filter bounds (pixels).
+    illumination : int
+        0 = light objects on dark background, 1 = dark objects on light background.
+    raw_stack : list of np.ndarray or None
+        Optional raw (pre-background-subtraction) frames.  When provided,
+        intensity metrics (mean_intensity, max_intensity, etc.) are measured
+        from these frames using the mask derived from ``stack``.  This avoids
+        background-subtraction normalization artifacts in the pumping signal.
+        When None, intensities are measured from ``stack`` (previous behaviour).
 
     Returns
     -------
@@ -1365,9 +1383,11 @@ def collect_detections_pumping(stack, global_thresh, min_area, max_area, illumin
                                        max_area=max_area,
                                        thresh=global_thresh,
                                        illumination=illumination)
+        raw_frame = raw_stack[frame_no] if raw_stack is not None else frame
         for prop in props:
             y, x = prop.centroid
-            pixel_vals = frame[prop.slice][prop.image]
+            pixel_vals = raw_frame[prop.slice][prop.image]
+            q75 = np.percentile(pixel_vals, 75)
             records.append({
                 "frame":                frame_no,
                 "x":                    x,
@@ -1376,6 +1396,7 @@ def collect_detections_pumping(stack, global_thresh, min_area, max_area, illumin
                 "area_convex":          prop.area_convex,
                 "mean_intensity":       float(np.mean(pixel_vals)),
                 "max_intensity":        float(np.max(pixel_vals)),
+                "mean_top_quartile":    float(np.mean(pixel_vals[pixel_vals >= q75])),
                 "integrated_intensity": float(np.sum(pixel_vals)),
                 "_det_id":              det_id,
             })
@@ -1426,6 +1447,7 @@ def analyze_pumping(tracks, frame_rate, min_track_frames=None, peak_prominence=1
                  n_pumps_ampd, mean_rate_hz_ampd  (ampd cols None if unavailable)
     """
     from scipy.signal import find_peaks
+    from scipy.ndimage import uniform_filter1d
 
     try:
         from pyampd.ampd import find_peaks as ampd_find_peaks
@@ -1449,8 +1471,14 @@ def analyze_pumping(tracks, frame_rate, min_track_frames=None, peak_prominence=1
         intensity  = group["mean_intensity"].values
         duration_s = len(frames_arr) / frame_rate
 
+        # Light smoothing for AMPD only: suppresses single-frame mask-shape
+        # noise that can create spurious local maxima when pyampd detrends.
+        # scipy uses the raw signal — prominence already rejects noise spikes
+        # and smoothing at fast pump rates (>3 Hz at 20fps) merges real peaks.
+        smoothed = uniform_filter1d(intensity.astype(float), size=3)
+
         # ── scipy ──────────────────────────────────────────────────────────────
-        scipy_idx, _ = find_peaks(intensity, prominence=peak_prominence)
+        scipy_idx, _ = find_peaks(intensity.astype(float), prominence=peak_prominence)
         for idx in scipy_idx:
             pump_events.append({
                 "particle": particle,
@@ -1461,9 +1489,18 @@ def analyze_pumping(tracks, frame_rate, min_track_frames=None, peak_prominence=1
 
         # ── pyampd ─────────────────────────────────────────────────────────────
         ampd_idx = []
-        if has_ampd:
+        if has_ampd and np.ptp(smoothed) > 0:
             try:
-                ampd_idx = list(ampd_find_peaks(intensity))
+                raw_idx = ampd_find_peaks(smoothed)
+                # pyampd detrends internally; after detrending, original minima
+                # can appear as local maxima.  Filter to indices that are true
+                # local maxima in the smoothed signal.
+                n = len(smoothed)
+                ampd_idx = [
+                    idx for idx in raw_idx
+                    if (idx == 0 or smoothed[idx] > smoothed[idx - 1])
+                    and (idx == n - 1 or smoothed[idx] > smoothed[idx + 1])
+                ]
                 for idx in ampd_idx:
                     pump_events.append({
                         "particle": particle,
