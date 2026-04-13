@@ -56,8 +56,16 @@ def main():
                         help="Number of parallel workers (default: 4)")
     args = parser.parse_args()
 
-    directory   = Path(os.path.abspath(args.directory))
-    config      = os.path.abspath(args.config)
+    directory = Path(args.directory).resolve()
+    if not directory.is_dir():
+        print(f"ERROR: Directory not found: {directory}")
+        sys.exit(1)
+
+    config = str(Path(args.config).resolve())
+    if not Path(config).is_file():
+        print(f"ERROR: Config file not found: {config}")
+        sys.exit(1)
+
     video_files = sorted(
         f for f in directory.rglob("*") if f.suffix.lower() in VIDEO_EXTENSIONS
     )
