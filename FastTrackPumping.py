@@ -275,6 +275,7 @@ def main(file_path, config_path, verbose=False):
     tracking.plot_trajectories(stack=first_frame, tracks=tracks, output_path=result_path)
 
     ####### 9. Save outputs ########
+    tracks["time_s"] = tracks["frame"] / frame_rate
     print(f'saving tracked centroids to {os.path.join(result_path, "tracks.csv")}')
     tracks.to_csv(os.path.join(result_path, "tracks.csv"), index=False)
 

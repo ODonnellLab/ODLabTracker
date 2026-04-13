@@ -21,8 +21,8 @@ parser.add_argument("-p", "--particle",   type=int,       default=None,
 parser.add_argument("--signal",           default="mean_intensity",
                     choices=["mean_intensity", "max_intensity", "mean_top_quartile"],
                     help="Which intensity column to use (default: mean_intensity)")
-parser.add_argument("--fps",             type=float, default=None,
-                    help="Frame rate in Hz (default: infer from tracks.csv frame spacing)")
+parser.add_argument("--fps",             type=float, default=20.0,
+                    help="Frame rate in Hz (default: 20)")
 parser.add_argument("--smooth",          type=int,   default=3,
                     help="Uniform-filter window size for AMPD (1 = no smoothing, default: 3)")
 parser.add_argument("--prominence",      type=float, default=10,
@@ -48,11 +48,6 @@ if len(g) == 0:
 frames_arr = g["frame"].values
 raw        = g[args.signal].values.astype(float)
 
-# Infer frame rate from median frame spacing if not given
-if args.fps is None:
-    spacing = np.median(np.diff(frames_arr))
-    args.fps = 1.0 / spacing if spacing > 0 else 20.0
-    print(f"Inferred frame rate: {args.fps:.1f} fps  (median frame spacing = {spacing:.1f})")
 
 time_s   = frames_arr / args.fps
 smoothed = uniform_filter1d(raw, size=args.smooth)
