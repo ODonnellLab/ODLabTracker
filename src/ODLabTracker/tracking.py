@@ -1513,13 +1513,27 @@ def analyze_pumping(tracks, frame_rate, min_track_frames=None, peak_prominence=1
             except Exception as e:
                 print(f"  pyampd failed for particle {particle}: {e}")
 
+        n_scipy = len(scipy_idx)
+        n_ampd  = len(ampd_idx) if has_ampd else None
+
+        # Quality flags for censoring
+        few_pumps = n_scipy < 5 or (n_ampd is not None and n_ampd < 5)
+        if n_ampd is not None and n_ampd > 0 and n_scipy > 0:
+            method_disagree = abs(n_scipy - n_ampd) / max(n_scipy, n_ampd) > 0.20
+        else:
+            method_disagree = n_ampd is not None  # one is zero, other isn't
+        flag_censor = few_pumps or method_disagree
+
         pump_summary.append({
             "particle":           particle,
             "track_duration_s":   round(duration_s, 2),
-            "n_pumps_scipy":      len(scipy_idx),
-            "mean_rate_hz_scipy": round(len(scipy_idx) / duration_s, 3) if duration_s > 0 else None,
-            "n_pumps_ampd":       len(ampd_idx) if has_ampd else None,
-            "mean_rate_hz_ampd":  round(len(ampd_idx) / duration_s, 3) if has_ampd and duration_s > 0 else None,
+            "n_pumps_scipy":      n_scipy,
+            "mean_rate_hz_scipy": round(n_scipy / duration_s, 3) if duration_s > 0 else None,
+            "n_pumps_ampd":       n_ampd,
+            "mean_rate_hz_ampd":  round(n_ampd / duration_s, 3) if n_ampd is not None and duration_s > 0 else None,
+            "flag_censor":        flag_censor,
+            "flag_few_pumps":     few_pumps,
+            "flag_method_disagree": method_disagree,
         })
 
     return pd.DataFrame(pump_events), pd.DataFrame(pump_summary)
