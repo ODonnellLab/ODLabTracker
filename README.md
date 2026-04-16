@@ -80,6 +80,12 @@ python track.py -c configs\your_config.yaml -f path\to\video.avi
 
 ---
 
+## Documentation
+
+- **[Pumping analysis tutorial](docs/pumping_tutorial.md)** — full walkthrough of pumping mode: config setup, running a batch, output files, and interpreting HMM state classification results
+
+---
+
 ## Usage
 
 All analysis runs through the `track.py` entry point. The analysis mode is set by the `mode:` key in the config file.
@@ -129,6 +135,7 @@ backsub_frames: 10    # number of frames averaged for background model
 pixel_length: 60      # pixels per mm (for speed calculations)
 thresh: None          # manual threshold; None = auto (Otsu)
 thresh_method: otsu   # auto-threshold method: otsu, triangle, yen, li
+min_thresh: null      # floor for auto-threshold; null = auto-detect from background noise (backsub only); set explicitly to override
 max_objects: null     # max detections per frame; threshold raised if exceeded
 ```
 
@@ -162,6 +169,7 @@ Results are saved to a folder named `<video_name>_results/` next to the input vi
 | `tracks.csv` | Per-frame centroid positions and intensity measurements |
 | `pumping_events.csv` | Frame index and method for each detected pump |
 | `pumping_summary.csv` | Per-particle: track duration, pump count, mean rate (Hz) |
+| `pumping_ipi_states.csv` | Per-IPI HMM state assignments (quiescent/slow/fast) for non-censored particles |
 | `pixel_data.pkl` | Per-ROI pixel arrays keyed by `(particle, frame)` |
 | `particle_<N>_pumping.mp4` | Annotated video for the best-tracked particle |
 
@@ -223,6 +231,37 @@ tail -f logs/video_name.log
 ```
 
 Completion status prints to the terminal as each job finishes.
+
+After all jobs finish, pumping results are automatically collected into:
+
+| File | Description |
+|------|-------------|
+| `batch_pumping_summary.csv` | One row per particle; includes bout statistics and derived rates |
+| `batch_pumping_plots.png` | Strip plots of active pump rate, quiescence entry rate, and mean bout duration per condition |
+| `batch_pumping_report.md` | Markdown summary with plots, per-condition stats, and mixed model results |
+
+Per-particle bout statistics computed from `pumping_events.csv`:
+
+| Column | Description |
+|--------|-------------|
+| `n_pumps_ampd_active` | AMPD pump count outside quiescent windows |
+| `active_duration_s` | Track duration minus total quiescent time |
+| `n_quiescent_bouts` | Number of quiescent bouts (maximal runs of IPIs > 0.417 s) |
+| `total_quiescent_time_s` | Total seconds spent in quiescent bouts |
+
+Six Poisson GLMMs (via R/lme4) are fit across two balanced comparisons:
+- **Food type**: fed animals, OP50 vs JUb39 — active rate, entry rate, exit rate
+- **Feeding state**: OP50 animals, fed vs off-food — active rate, entry rate, exit rate
+
+To supply genotype/food/condition labels, provide a metadata CSV:
+
+```bash
+python run_fasttrack_parallel.py <directory> -c configs/... -j 4 --metadata metadata.csv
+```
+
+The metadata CSV must have columns: `folder_name, genotype, food, condition`.
+
+Use `--no-summary` to skip the collection step.
 
 Use this when:
 - You have many files and want to use idle CPU cores

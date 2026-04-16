@@ -103,13 +103,15 @@ def FastTrackIter(file_path,config_data):
     # Compute global threshold
     max_objects = config_data.get('max_objects', None)
 
+    min_thresh = config_data.get('min_thresh', None)
     if thresh is None:
         _, _, global_thresh = tracking.preprocess_frame(first_frame,
                                                         min_area,
                                                         max_area,
                                                         thresh,
                                                         illumination=illumination,
-                                                        max_objects=max_objects)
+                                                        max_objects=max_objects,
+                                                        min_thresh=min_thresh)
     else:
         print("tracking video using manual threshold")
         global_thresh = thresh

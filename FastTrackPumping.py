@@ -68,6 +68,7 @@ def main(file_path, config_path, verbose=False):
     peak_prominence       = config_data.get('peak_prominence', 10)
     stitch_gap_frames     = config_data.get('stitch_gap_frames', gap_range)
     stitch_gap_pixels     = config_data.get('stitch_gap_pixels', search_range * 2)
+    min_thresh            = config_data.get('min_thresh', None)
 
     print(f'{Colors.PURPLE}PARAMETER SETTINGS (pumping mode):{Colors.ENDC}')
     print(f'minimum area in pixels: {Colors.GREEN}{min_area}{Colors.ENDC}')
@@ -182,6 +183,21 @@ def main(file_path, config_path, verbose=False):
         print(f"  [diag] subtracted frame[0]: min={first_frame.min()}  "
               f"max={first_frame.max()}  mean={first_frame.mean():.1f}")
 
+        # Auto-compute noise floor from the background frame.
+        # Since pharynx pixels are a small minority of the field, std of the
+        # average frame reflects camera/background noise rather than signal.
+        # threshold = ceil(2 * noise_std) gives a conservative noise floor that
+        # adapts to camera binning and gain without manual tuning.
+        # Explicit min_thresh in config overrides this estimate.
+        if min_thresh is None:
+            noise_est  = float(np.std(average_frame))
+            min_thresh = int(np.ceil(2 * noise_est))
+            print(f"  [diag] background noise σ={noise_est:.2f}  "
+                  f"→ auto min_thresh={min_thresh}")
+        else:
+            print(f"  [diag] using config min_thresh={min_thresh} "
+                  f"(background σ={np.std(average_frame):.2f})")
+
     ####### 5. Tracking ########
     print(f"Tracking and linking objects from {len(frames)} frames")
 
@@ -189,7 +205,7 @@ def main(file_path, config_path, verbose=False):
         _, _, global_thresh = tracking.preprocess_frame(
             first_frame, min_area, max_area, thresh,
             illumination=illumination, thresh_method=thresh_method,
-            max_objects=max_objects)
+            max_objects=max_objects, min_thresh=min_thresh)
     else:
         print("tracking video using manual threshold")
         global_thresh = thresh
@@ -234,6 +250,16 @@ def main(file_path, config_path, verbose=False):
     if not pump_summary.empty:
         print("\nPumping summary:")
         print(pump_summary.to_string(index=False))
+
+    ####### 6b. HMM state classification ########
+    ipi_states_df = None
+    if not pump_summary.empty:
+        print("\nClassifying pumping states (HMM)")
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "models", "pumping_hmm.pkl")
+        pump_summary, ipi_states_df = tracking.classify_pumping_states(
+            pump_events, pump_summary, model_path=model_path
+        )
 
     ####### 7. Pumping video ########
     best_particle = tracking.find_best_pumping_particle(tracks, pump_summary)
@@ -288,6 +314,11 @@ def main(file_path, config_path, verbose=False):
         pump_summary_path = os.path.join(result_path, "pumping_summary.csv")
         pump_summary.to_csv(pump_summary_path, index=False)
         print(f"pumping summary saved to {pump_summary_path}")
+
+    if ipi_states_df is not None and not ipi_states_df.empty:
+        ipi_states_path = os.path.join(result_path, "pumping_ipi_states.csv")
+        ipi_states_df.to_csv(ipi_states_path, index=False)
+        print(f"HMM IPI state assignments saved to {ipi_states_path}")
 
     pixel_pkl_path = os.path.join(result_path, "pixel_data.pkl")
     with open(pixel_pkl_path, "wb") as f:
