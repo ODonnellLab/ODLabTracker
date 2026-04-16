@@ -169,7 +169,7 @@ Results are saved to a folder named `<video_name>_results/` next to the input vi
 | `tracks.csv` | Per-frame centroid positions and intensity measurements |
 | `pumping_events.csv` | Frame index and method for each detected pump |
 | `pumping_summary.csv` | Per-particle: track duration, pump count, mean rate (Hz) |
-| `pumping_ipi_states.csv` | Per-IPI HMM state assignments (quiescent/slow/fast) for non-censored particles |
+| `pumping_ipi_states.csv` | Per-IPI state assignments (quiescent/active) for non-censored particles |
 | `pixel_data.pkl` | Per-ROI pixel arrays keyed by `(particle, frame)` |
 | `particle_<N>_pumping.mp4` | Annotated video for the best-tracked particle |
 

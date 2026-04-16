@@ -1538,12 +1538,20 @@ def analyze_pumping(tracks, frame_rate, min_track_frames=None, peak_prominence=1
     return pd.DataFrame(pump_events), pd.DataFrame(pump_summary)
 
 
-def classify_pumping_states(pump_events, pump_summary, model_path=None):
-    """Classify per-particle pumping into quiescent / slow / fast states.
+# Hard-coded quiescent IPI threshold used when no HMM model is available.
+# 1.0 s = 20 frames at 20 fps — an unambiguous missed-pump gap.
+DEFAULT_QUIESCENT_IPI_THRESH = 1.0   # seconds
 
-    Uses a pre-fitted 3-state Gaussian HMM trained on a reference dataset of
-    6 conditions (223 particles).  Scipy IPIs gate quiescence; AMPD peaks
-    within active windows give the most precise active-rate estimate.
+
+def classify_pumping_states(pump_events, pump_summary, model_path=None):
+    """Classify per-particle pumping states.
+
+    Primary path: hard threshold at DEFAULT_QUIESCENT_IPI_THRESH (1.0 s).
+    Enhancement:  if a valid pumping_hmm.pkl bundle is found, the HMM's
+    Viterbi decoder is used for smoothed state assignments and the bundle's
+    quiescent threshold overrides the default.  HMM-specific columns
+    (frac_slow, frac_fast, rate_slow_hz, rate_fast_hz) are populated only
+    when a model is loaded; they are NaN otherwise.
 
     Parameters
     ----------
@@ -1552,78 +1560,90 @@ def classify_pumping_states(pump_events, pump_summary, model_path=None):
     pump_summary : pd.DataFrame
         Output of analyze_pumping — results are appended as new columns.
     model_path : str or None
-        Path to pumping_hmm.pkl.  If None, looks for
-        models/pumping_hmm.pkl relative to this file's package root.
+        Path to pumping_hmm.pkl.  If None, looks in models/pumping_hmm.pkl
+        relative to the package root.  Pass an empty string '' to force
+        threshold-only mode even when a model file exists.
 
     Returns
     -------
     pump_summary : pd.DataFrame
         Original rows with the following columns added:
           frac_quiescent      — fraction of track time in scipy gaps > threshold
-          frac_slow           — HMM slow-state fraction (scipy IPI sequence)
-          frac_fast           — HMM fast-state fraction (scipy IPI sequence)
-          rate_slow_hz        — mean pumping rate within slow-state intervals
-          rate_fast_hz        — mean pumping rate within fast-state intervals
+          frac_slow           — HMM slow-state fraction (NaN without model)
+          frac_fast           — HMM fast-state fraction (NaN without model)
+          rate_slow_hz        — mean rate in slow-state intervals (NaN without model)
+          rate_fast_hz        — mean rate in fast-state intervals (NaN without model)
           rate_active_ampd_hz — AMPD rate during non-quiescent windows
-          flag_hmm_censored   — True if particle had too few scipy events to classify
+          flag_hmm_censored   — True if particle had too few scipy events
     ipi_states_df : pd.DataFrame
-        Per-IPI state assignments for all non-censored particles:
-          particle, t_start_s, t_end_s, ipi_s, state (quiescent/slow/fast)
-        Censored particles are absent.  Use this for bout-level analysis.
+        Per-IPI state assignments (all particles with >= min_events):
+          particle, t_start_s, t_end_s, ipi_s, state (quiescent / active or slow / fast)
     """
     import pickle
     import os
 
-    # ── Load model bundle ─────────────────────────────────────────────────────
-    if model_path is None:
-        pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        model_path = os.path.join(pkg_root, "..", "models", "pumping_hmm.pkl")
-        model_path = os.path.normpath(model_path)
+    # ── Attempt to load HMM bundle ────────────────────────────────────────────
+    model      = None
+    state_names = None
 
-    if not os.path.exists(model_path):
-        print(f"  [HMM] model file not found at {model_path} — skipping classification")
-        return pump_summary
+    if model_path != "":          # empty string = force threshold mode
+        if model_path is None:
+            pkg_root   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            model_path = os.path.normpath(
+                os.path.join(pkg_root, "..", "models", "pumping_hmm.pkl"))
 
-    with open(model_path, "rb") as f:
-        bundle = pickle.load(f)
+        if os.path.exists(model_path):
+            try:
+                with open(model_path, "rb") as f:
+                    bundle = pickle.load(f)
+                model       = bundle["model"]
+                state_names = bundle["state_names"]
+                q_thresh    = bundle["quiescent_ipi_thresh"]
+                min_events  = bundle["min_scipy_events"]
+                train_p10   = bundle["training_ipi_p10"]
+                train_p90   = bundle["training_ipi_p90"]
 
-    model               = bundle["model"]
-    state_names         = bundle["state_names"]          # ["quiescent","slow","fast"]
-    q_thresh            = bundle["quiescent_ipi_thresh"] # seconds
-    min_events          = bundle["min_scipy_events"]
-    train_median        = bundle["training_median_ipi"]
-    train_p10           = bundle["training_ipi_p10"]
-    train_p90           = bundle["training_ipi_p90"]
+                # Validate: check batch IPI distribution is within training range
+                all_sc_ipis = []
+                for p in pump_events["particle"].unique():
+                    sc = pump_events[(pump_events["particle"] == p) &
+                                     (pump_events["method"] == "scipy")
+                                     ].sort_values("time_s")
+                    if len(sc) >= 2:
+                        all_sc_ipis.extend(np.diff(sc["time_s"].values).tolist())
 
-    # ── Batch-level boundary check ────────────────────────────────────────────
-    all_sc_ipis = []
-    for p in pump_events["particle"].unique():
-        sc = pump_events[(pump_events["particle"]==p) &
-                         (pump_events["method"]=="scipy")].sort_values("time_s")
-        if len(sc) >= 2:
-            all_sc_ipis.extend(np.diff(sc["time_s"].values).tolist())
+                if all_sc_ipis:
+                    batch_ipi         = np.array(all_sc_ipis)
+                    batch_median      = float(np.median(batch_ipi))
+                    frac_above_thresh = float((batch_ipi > q_thresh).mean())
 
-    flag_boundary = False
-    if all_sc_ipis:
-        batch_ipi = np.array(all_sc_ipis)
-        batch_median = float(np.median(batch_ipi))
-        frac_above_thresh = float((batch_ipi > q_thresh).mean())
+                    out_of_range = (batch_median < train_p10 or
+                                    batch_median > train_p90)
+                    bad_frac     = (frac_above_thresh < 0.01 or
+                                    frac_above_thresh > 0.80)
 
-        if batch_median < train_p10 or batch_median > train_p90:
-            flag_boundary = True
-            print(f"  [HMM] WARNING: batch median IPI ({batch_median:.3f}s) is outside "
-                  f"training range ({train_p10:.3f}–{train_p90:.3f}s). "
-                  f"Quiescent boundary ({q_thresh:.3f}s) may be misaligned.")
-        if frac_above_thresh < 0.01 or frac_above_thresh > 0.80:
-            flag_boundary = True
-            print(f"  [HMM] WARNING: {frac_above_thresh*100:.1f}% of scipy IPIs exceed "
-                  f"the quiescent threshold ({q_thresh:.3f}s) — expected 1–80%. "
-                  f"Consider retraining the model for this condition.")
+                    if out_of_range or bad_frac:
+                        print(f"  [HMM] WARNING: batch median IPI ({batch_median:.3f}s) "
+                              f"or quiescent fraction ({frac_above_thresh*100:.1f}%) "
+                              f"outside training range — using HMM states but "
+                              f"interpret frac_quiescent with caution.")
+                    else:
+                        print(f"  [HMM] Boundary check passed  "
+                              f"(median IPI={batch_median:.3f}s, "
+                              f"{frac_above_thresh*100:.1f}% above threshold)")
 
-    if not flag_boundary:
-        print(f"  [HMM] Boundary check passed  "
-              f"(batch median IPI={batch_median:.3f}s, "
-              f"{frac_above_thresh*100:.1f}% above threshold)")
+            except Exception as exc:
+                print(f"  [HMM] Could not load model ({exc}) — "
+                      f"falling back to {DEFAULT_QUIESCENT_IPI_THRESH} s threshold")
+                model = None
+        else:
+            print(f"  [HMM] No model found at {model_path} — "
+                  f"using hard threshold ({DEFAULT_QUIESCENT_IPI_THRESH} s)")
+
+    if model is None:
+        q_thresh   = DEFAULT_QUIESCENT_IPI_THRESH
+        min_events = 4          # need at least 3 IPIs for meaningful stats
+        print(f"  [threshold] Classifying quiescence with IPI > {q_thresh} s")
 
     # ── Per-particle classification ───────────────────────────────────────────
     hmm_rows       = []
@@ -1664,16 +1684,28 @@ def classify_pumping_states(pump_events, pump_summary, model_path=None):
         def _in_quiescent(t):
             return any(s <= t <= e for s, e in q_intervals)
 
-        # ── HMM decode on scipy IPI sequence ─────────────────────────────────
-        log_ipi = np.log(ipi_sc).reshape(-1, 1)
-        states  = model.predict(log_ipi)
+        # ── State assignment: HMM decode or hard threshold ────────────────────
+        def _r(v):
+            return round(float(v), 4) if v is not None and not np.isnan(v) else np.nan
 
-        frac = {}
-        rates = {}
-        for s_idx, s_name in enumerate(state_names):
-            mask = states == s_idx
-            frac[s_name]  = ipi_sc[mask].sum() / total_t if total_t > 0 else 0.0
-            rates[s_name] = (1.0 / ipi_sc[mask].mean()) if mask.sum() > 0 else np.nan
+        if model is not None:
+            # HMM Viterbi decode on log-IPI sequence
+            log_ipi = np.log(ipi_sc).reshape(-1, 1)
+            states  = model.predict(log_ipi)
+            state_labels = [state_names[s] for s in states]
+
+            frac = {}
+            rates = {}
+            for s_idx, s_name in enumerate(state_names):
+                mask = states == s_idx
+                frac[s_name]  = ipi_sc[mask].sum() / total_t if total_t > 0 else 0.0
+                rates[s_name] = (1.0 / ipi_sc[mask].mean()) if mask.sum() > 0 else np.nan
+        else:
+            # Hard threshold: quiescent if IPI > q_thresh, else active
+            state_labels = ["quiescent" if ipi > q_thresh else "active"
+                            for ipi in ipi_sc]
+            frac  = {}
+            rates = {}
 
         # ── AMPD active rate (exclude quiescent windows) ──────────────────────
         am_active = np.array([t for t in t_am if not _in_quiescent(t)])
@@ -1687,34 +1719,31 @@ def classify_pumping_states(pump_events, pump_summary, model_path=None):
 
         base_row.update({
             "frac_quiescent":      round(frac_quiescent, 4),
-            "frac_slow":           round(frac.get("slow",  0.0), 4),
-            "frac_fast":           round(frac.get("fast",  0.0), 4),
-            "rate_slow_hz":        round(rates.get("slow",  np.nan), 4)
-                                   if not np.isnan(rates.get("slow",  np.nan)) else np.nan,
-            "rate_fast_hz":        round(rates.get("fast",  np.nan), 4)
-                                   if not np.isnan(rates.get("fast",  np.nan)) else np.nan,
-            "rate_active_ampd_hz": round(rate_active_ampd, 4)
-                                   if not np.isnan(rate_active_ampd) else np.nan,
+            "frac_slow":           round(frac["slow"], 4) if "slow" in frac else np.nan,
+            "frac_fast":           round(frac["fast"], 4) if "fast" in frac else np.nan,
+            "rate_slow_hz":        _r(rates.get("slow")),
+            "rate_fast_hz":        _r(rates.get("fast")),
+            "rate_active_ampd_hz": _r(rate_active_ampd),
         })
         hmm_rows.append(base_row)
 
-        # Per-IPI state records for this particle
-        for i, (st, t0, t1, dur) in enumerate(
-                zip(states, t_sc[:-1], t_sc[1:], ipi_sc)):
+        # Per-IPI state records
+        for label, t0, t1, dur in zip(state_labels, t_sc[:-1], t_sc[1:], ipi_sc):
             ipi_state_rows.append({
                 "particle":  int(p),
                 "t_start_s": round(float(t0),  6),
                 "t_end_s":   round(float(t1),  6),
                 "ipi_s":     round(float(dur), 6),
-                "state":     state_names[st],
+                "state":     label,
             })
 
     hmm_df = pd.DataFrame(hmm_rows)
     pump_summary = pump_summary.merge(hmm_df, on="particle", how="left")
 
+    mode_label   = "HMM" if model is not None else "threshold"
     n_classified = (~hmm_df["flag_hmm_censored"]).sum()
     n_censored   = hmm_df["flag_hmm_censored"].sum()
-    print(f"  [HMM] Classified {n_classified} particles  "
+    print(f"  [{mode_label}] Classified {n_classified} particles  "
           f"({n_censored} censored — fewer than {min_events} scipy events)")
 
     ipi_states_df = pd.DataFrame(ipi_state_rows)

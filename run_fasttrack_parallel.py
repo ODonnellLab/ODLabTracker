@@ -41,7 +41,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 
 VIDEO_EXTENSIONS      = {".avi", ".mp4", ".tif", ".tiff"}
-QUIESCENT_IPI_THRESH  = 0.417   # seconds — must match HMM model threshold
+QUIESCENT_IPI_THRESH  = 1.0     # seconds — unambiguous pump-miss boundary (20 frames at 20 fps)
 MIN_ACTIVE_DURATION_S = 5.0     # seconds — minimum active window to compute AMPD rate
 
 
