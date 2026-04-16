@@ -33,7 +33,9 @@ def main():
     directory  = Path(os.path.abspath(args.directory))
     config     = os.path.abspath(args.config)
     video_files = sorted(
-        f for f in directory.rglob("*") if f.suffix.lower() in VIDEO_EXTENSIONS
+        f for f in directory.rglob("*")
+        if f.suffix.lower() in VIDEO_EXTENSIONS
+        and not f.stem.endswith("_pumping")
     )
 
     if not video_files:

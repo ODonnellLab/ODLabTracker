@@ -80,6 +80,7 @@ def main(file_path, config_path, verbose=False):
     max_instantaneous_speed = config_data['max_instantaneous_speed']
     stability_threshold = config_data['stability_threshold']
     max_objects   = config_data.get('max_objects', None)
+    min_thresh    = config_data.get('min_thresh', None)
 
     print(f'{Colors.PURPLE}PARAMETER SETTINGS:{Colors.ENDC}')
     print(f'minimum area of worm in pixels: {Colors.GREEN}{min_area}{Colors.ENDC}')
@@ -182,7 +183,7 @@ def main(file_path, config_path, verbose=False):
         _, _, global_thresh = tracking.preprocess_frame(
             first_frame, min_area, max_area, thresh,
             illumination=illumination, thresh_method=thresh_method,
-            max_objects=max_objects)
+            max_objects=max_objects, min_thresh=min_thresh)
     else:
         print("tracking video using manual threshold")
         global_thresh = thresh
