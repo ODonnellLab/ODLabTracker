@@ -1,3 +1,4 @@
+mode: postural # analysis mode: centroid (fast: CoM + speed), postural (+ reversals/pirouettes), pumping (pharyngeal pumping)
 min_area: 150 #min area of worm in pixels
 max_area: 700 #max area of worm in pixels
 gap_range: 8 # max number of frame gap to link worms (i.e. can a worm disappear for more frames?)
@@ -11,6 +12,7 @@ subsample: 1 # frames to keep (1/n frames), will speed up analysis of videos wit
 backsub: True # for IR illumination, this works much better
 backsub_frames: 20 # number of evenly-spaced frames to subtract background
 pixel_length: 60 # number of pixels/mm
+normalize_illumination: true # per-frame median-brightness normalization to correct illumination flicker before background subtraction
 speed_threshold: 0.03 # minimum speed to be considered moving (mm/sec)
 min_displacement_for_angle: 0.001  # Ignore angle when moving < n mm between frames 
 
@@ -21,9 +23,14 @@ direction_change_threshold: 1.57 # minimum change in direction to call a reversa
 min_run_length: 5 # minimum run length to be considered a forward run (in frames)
 smooth_positions: True # reduce position jittering due to high frame rates
 smooth_window: 5 # window for smoothing (n_frames)
-reversal_persistence: 3 # requires a large angle change to persist for n frames to be counted 
+reversal_persistence: 2 # consecutive qualifying frames required to confirm reversal onset; filters single-frame spikes from forward-filled movement_angle during pauses
 pirouette_speed_threshold: 0.1 # max speed to be considered a pirouette 0.1 mm/s (slightly slower than forward movement)
 pirouette_eccentricity_threshold: 0.9 # body becomes rounder at lower values. Most worms are close to 1 during runs. 
 min_pirouette_duration: 4 # minimum number of consecutive frames to call a pirouette
 max_instantaneous_speed: 0.6 # Cap unrealistic speeds mm/sec
 stability_threshold: 0.88 # Very strict stability requirement for movement angles changes 1 = no change in angle
+area_reliability_threshold: 0.70 # block reversal entry when area < this fraction of per-particle median (partial thresholding / out-of-frame guard)
+merge_reversal_gap: 5 # merge adjacent reversal events separated by <= this many frames (repairs splits from brief unreliable frames mid-reversal)
+boundary_margin: null   # px from frame edge to censor (null = auto from median major_axis, ~one worm length)
+max_area_cv: null       # max within-track area CV to keep (null = disabled; try 0.4 to remove fragmented tracks)
+save_annotated_video: false # set true to generate per-worm annotated video (slow: ~60s/video)

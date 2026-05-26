@@ -493,6 +493,36 @@ def filter_short_tracks(tracks, min_length=10):
     keep_ids = counts[counts >= min_length].index
     return tracks[tracks["particle"].isin(keep_ids)].copy()
 
+def filter_boundary_particles(tracks, frame_shape, margin_px):
+    """Remove particles whose median centroid is within margin_px of any frame edge.
+
+    Censors LED-ring artifacts and plate-edge detections. Use half a worm-length
+    (~major_axis median / 2) as margin_px.
+
+    Parameters
+    ----------
+    tracks : pd.DataFrame  with 'particle', 'x', 'y' columns
+    frame_shape : (H, W) tuple — shape of the video frames
+    margin_px : float — exclusion zone width in pixels from each frame edge
+
+    Returns
+    -------
+    filtered : pd.DataFrame
+    n_removed : int — number of particles removed
+    """
+    H, W = frame_shape
+    grp = tracks.groupby("particle")
+    med_x = grp["x"].median()
+    med_y = grp["y"].median()
+    dist_to_edge = pd.concat([med_x, W - med_x, med_y, H - med_y], axis=1).min(axis=1)
+    keep = dist_to_edge[dist_to_edge >= margin_px].index
+    n_removed = len(dist_to_edge) - len(keep)
+    if n_removed:
+        print(f"  filter_boundary_particles: removed {n_removed} particles "
+              f"with median centroid within {margin_px:.0f} px of frame edge")
+    return tracks[tracks["particle"].isin(keep)].copy(), n_removed
+
+
 def stitch_tracks(tracks, max_gap_frames, max_gap_pixels):
     """Post-hoc track stitching: merge track fragments where one ends close in
     space and time to where another begins.
@@ -652,359 +682,405 @@ def load_video_frames(path, max_frames=None):
 
     return np.stack(frames, axis=0)
 
-def calculate_motion_parameters(df, 
-                                pixel_length=60,           # pixels/mm
-                                frame_rate=10,             # frames/sec
-                                window_size=7, 
-                                direction_threshold=np.pi/2,
-                                speed_threshold=0.5,       # mm/s
-                                min_run_length=10,
-                                smooth_window=5,           # Increase default smoothing
-                                min_displacement_for_angle=1.5,  # mm
-                                pirouette_speed_threshold=0.3,   # mm/s
-                                pirouette_eccentricity_threshold=0.8,
-                                min_pirouette_duration=2,
-                                max_instantaneous_speed=5.0,     # mm/s - filter outliers
-                                stability_threshold=0.90):        # Higher = stricter
+def _count_consecutive_true(series):
+    result = np.zeros(len(series), dtype=int)
+    count = 0
+    for i, val in enumerate(series):
+        if val:
+            count += 1
+            result[i] = count
+        else:
+            count = 0
+    return result
+
+
+def calculate_speed_parameters(df,
+                               pixel_length=60,
+                               frame_rate=10,
+                               window_size=7,
+                               speed_threshold=0.5,
+                               smooth_window=5,
+                               min_displacement_for_angle=1.5,
+                               max_instantaneous_speed=5.0,
+                               stability_threshold=0.90):
+    """Phase 1 (centroid mode): smooth positions and compute speed/directional-stability.
+    Output is suitable for centroid-mode CSV or as input to calculate_postural_states().
     """
-    Calculate movement parameters with robust handling of noisy centroids.
-    
-    Parameters:
-    -----------
-    pixel_length : float
-        Pixels per mm conversion factor
-    frame_rate : float
-        Frames per second
-    window_size : int
-        Number of frames for rolling statistics
-    direction_threshold : float
-        Angle change (radians) to detect direction changes
-    speed_threshold : float
-        Minimum speed in mm/s to be considered moving
-    min_run_length : int
-        Minimum frames of stable movement to be considered a run
-    smooth_window : int
-        Window size for position smoothing
-    min_displacement_for_angle : float
-        Minimum displacement in mm to calculate meaningful angle
-    pirouette_speed_threshold : float
-        Maximum speed in mm/s during pirouette
-    pirouette_eccentricity_threshold : float
-        Maximum eccentricity during pirouette (body becomes rounder)
-    min_pirouette_duration : int
-        Minimum number of consecutive frames to be considered a pirouette
-    max_instantaneous_speed : float
-        Maximum plausible speed in mm/s - speeds above this are likely noise
-    stability_threshold : float
-        Direction stability threshold (0-1) for forward runs (higher = stricter)
-    """
-    
     df = df.copy()
     df = df.sort_values(['particle', 'frame'])
-    
-    # More aggressive smoothing with larger window
+
     df['x_smooth'] = df['x']
     df['y_smooth'] = df['y']
-    
     for particle in df['particle'].unique():
         mask = df['particle'] == particle
         particle_data = df.loc[mask].copy()
-        
         if len(particle_data) >= smooth_window:
-            # Median filter is robust to outliers
-            x_smooth = median_filter(particle_data['x'].values, size=smooth_window, mode='nearest')
-            y_smooth = median_filter(particle_data['y'].values, size=smooth_window, mode='nearest')
-            
-            df.loc[mask, 'x_smooth'] = x_smooth
-            df.loc[mask, 'y_smooth'] = y_smooth
-    
-    # Calculate velocities from smoothed positions (in pixels/frame)
+            df.loc[mask, 'x_smooth'] = median_filter(particle_data['x'].values, size=smooth_window, mode='nearest')
+            df.loc[mask, 'y_smooth'] = median_filter(particle_data['y'].values, size=smooth_window, mode='nearest')
+
     df['vx_pixels'] = df.groupby('particle')['x_smooth'].diff()
     df['vy_pixels'] = df.groupby('particle')['y_smooth'].diff()
-    
-    # Convert to physical units (mm/s)
-    df['vx'] = (df['vx_pixels'] / pixel_length) * frame_rate  # mm/s
-    df['vy'] = (df['vy_pixels'] / pixel_length) * frame_rate  # mm/s
-    df['speed_instantaneous'] = np.sqrt(df['vx']**2 + df['vy']**2)  # mm/s
-    
-    # Cap unrealistic speeds (likely noise)
-    df['speed_instantaneous'] = np.clip(df['speed_instantaneous'], 0, max_instantaneous_speed)
-    
-    # Use rolling median speed instead of instantaneous speed
-    # This is much more robust to centroid jitter
+    # Divide by actual frame gap so speed is correct across trackpy linking gaps
+    # (diff spans N frames but default assumes 1 frame, inflating speed N-fold)
+    df['_frame_gap'] = df.groupby('particle')['frame'].diff().fillna(1).clip(lower=1)
+    # vx/vy are signed velocity components (mm/s); speed is their scalar magnitude
+    df['vx'] = (df['vx_pixels'] / pixel_length) * frame_rate / df['_frame_gap']
+    df['vy'] = (df['vy_pixels'] / pixel_length) * frame_rate / df['_frame_gap']
+    df['speed_instantaneous'] = np.sqrt(df['vx']**2 + df['vy']**2).clip(upper=max_instantaneous_speed)
     df['speed'] = (df.groupby('particle')['speed_instantaneous']
                    .transform(lambda x: x.rolling(window_size, min_periods=1, center=True).median()))
-    
-    # Calculate displacement per frame in mm
-    df['displacement_mm'] = np.sqrt(df['vx_pixels']**2 + df['vy_pixels']**2) / pixel_length
-    
-    # Only calculate movement angle when displacement is meaningful
+    df['displacement_mm'] = np.sqrt(df['vx_pixels']**2 + df['vy_pixels']**2) / pixel_length / df['_frame_gap']
+    df = df.drop(columns=['_frame_gap'])
+
     df['movement_angle'] = np.nan
     significant_motion = df['displacement_mm'] > min_displacement_for_angle
     df.loc[significant_motion, 'movement_angle'] = np.arctan2(
-        df.loc[significant_motion, 'vx_pixels'], 
+        df.loc[significant_motion, 'vx_pixels'],
         df.loc[significant_motion, 'vy_pixels']
     )
-    
-    # Forward fill angles during small movements
     df['movement_angle'] = df.groupby('particle')['movement_angle'].ffill()
-    
-    # Calculate major axis components (in mm/s)
+
     df['major_axis_x'] = np.sin(df['orientation'])
     df['major_axis_y'] = np.cos(df['orientation'])
-    df['major_axis_component'] = (df['vx'] * df['major_axis_x'] + 
-                                   df['vy'] * df['major_axis_y'])  # mm/s
-    
-    # Calculate angular velocity of orientation (radians/s)
+    df['major_axis_component'] = df['vx'] * df['major_axis_x'] + df['vy'] * df['major_axis_y']
+
     df['d_orientation'] = df.groupby('particle')['orientation'].diff()
     df['d_orientation'] = np.where(
-        df['d_orientation'] > np.pi/2,
-        df['d_orientation'] - np.pi,
-        np.where(df['d_orientation'] < -np.pi/2,
-                 df['d_orientation'] + np.pi,
-                 df['d_orientation'])
+        df['d_orientation'] > np.pi/2, df['d_orientation'] - np.pi,
+        np.where(df['d_orientation'] < -np.pi/2, df['d_orientation'] + np.pi, df['d_orientation'])
     )
-    df['angular_velocity'] = df['d_orientation'] * frame_rate  # radians/s
-    
-    # Calculate rolling mean of movement angle using circular statistics
+    df['angular_velocity'] = df['d_orientation'] * frame_rate
+
     df['sin_angle'] = np.sin(df['movement_angle'])
     df['cos_angle'] = np.cos(df['movement_angle'])
-    
     df['mean_sin'] = (df.groupby('particle')['sin_angle']
                       .transform(lambda x: x.rolling(window_size, min_periods=1, center=False).mean()))
     df['mean_cos'] = (df.groupby('particle')['cos_angle']
                       .transform(lambda x: x.rolling(window_size, min_periods=1, center=False).mean()))
-    
     df['mean_movement_angle'] = np.arctan2(df['mean_sin'], df['mean_cos'])
-    
-    # Calculate directional stability as resultant vector length
     df['direction_stability'] = np.sqrt(df['mean_sin']**2 + df['mean_cos']**2)
-    
-    # Calculate mean speed (mm/s)
+
     df['mean_speed'] = (df.groupby('particle')['speed']
-                       .transform(lambda x: x.rolling(window_size, min_periods=1).mean()))
-    
-    # Calculate speed variability (coefficient of variation)
+                        .transform(lambda x: x.rolling(window_size, min_periods=1).mean()))
     df['speed_std'] = (df.groupby('particle')['speed']
                        .transform(lambda x: x.rolling(window_size, min_periods=1).std()))
-    
-    # Coefficient of variation (std/mean) - low values indicate steady movement
-    df['speed_cv'] = df['speed_std'] / (df['mean_speed'] + 1e-6)  # Add small value to avoid division by zero
-    
-    # Calculate angular difference from recent mean direction
+    df['speed_cv'] = df['speed_std'] / (df['mean_speed'] + 1e-6)
+
     df['angle_from_mean'] = df['movement_angle'] - df['mean_movement_angle']
     df['angle_from_mean'] = np.where(
-        df['angle_from_mean'] > np.pi,
-        df['angle_from_mean'] - 2*np.pi,
-        np.where(df['angle_from_mean'] < -np.pi,
-                 df['angle_from_mean'] + 2*np.pi,
-                 df['angle_from_mean'])
+        df['angle_from_mean'] > np.pi, df['angle_from_mean'] - 2*np.pi,
+        np.where(df['angle_from_mean'] < -np.pi, df['angle_from_mean'] + 2*np.pi, df['angle_from_mean'])
     )
-    
-    # Detect moving and stable states
-    df['is_moving'] = df['speed'] > speed_threshold
-    
-    # Stricter criteria for directional stability
-    # Must have: good direction consistency, steady speed, and sustained movement
-    df['is_directionally_stable'] = (
-        df['is_moving'] & 
-        (df['direction_stability'] > stability_threshold) &  # Very consistent direction
-        (df['mean_speed'] > speed_threshold) &               # Sustained speed
-        (df['speed_cv'] < 0.6)                                # Speed not too erratic (CV < 60%)
-    )
-    
-    # Count consecutive stable frames
-    def count_consecutive_true(series):
-        """Count consecutive True values, reset on False."""
-        result = np.zeros(len(series), dtype=int)
-        count = 0
-        for i, val in enumerate(series):
-            if val:
-                count += 1
-                result[i] = count
-            else:
-                count = 0
-        return result
-    
-    df['stable_run_counter'] = (df.groupby('particle')['is_directionally_stable']
-                                 .transform(count_consecutive_true))
 
-   # ========== REVERSAL DETECTION ==========
-    # Detect reversal START: large angle change after stable run
-    prev_stable_run = df.groupby('particle')['stable_run_counter'].shift(1)
-    prev_stationary = df.groupby('particle')['speed'].shift(1) < speed_threshold
-    prev_angle = df.groupby('particle')['angle_from_mean'].shift(1).abs()
-    
-    df['reversal_start'] = (
-        ( (prev_stable_run >= 0) | prev_stationary == True ) &
-        (np.abs(df['angle_from_mean']) > direction_threshold) &
-        (df['speed'] > speed_threshold) &  # Allow slightly slower
-        (prev_angle.fillna(0) <= direction_threshold)
+    df['is_moving'] = df['speed'] > speed_threshold
+    df['is_directionally_stable'] = (
+        df['is_moving'] &
+        (df['direction_stability'] > stability_threshold) &
+        (df['mean_speed'] > speed_threshold) &
+        (df['speed_cv'] < 0.6)
     )
-    
-    # Detect any large direction change (both reversal starts and returns to forward)
-    df['direction_change_event'] = (
-        (np.abs(df['angle_from_mean']) > direction_threshold) &
-        (prev_angle.fillna(0) <= direction_threshold)
+    df['stable_run_counter'] = (df.groupby('particle')['is_directionally_stable']
+                                 .transform(_count_consecutive_true))
+
+    # Per-particle area stability: CV of area across all frames.
+    # After illumination normalisation, real worms should have low CV;
+    # fragmented tracks or false detections show high CV.
+    if 'area' in df.columns:
+        grp_area = df.groupby('particle')['area']
+        area_mean = grp_area.transform('mean')
+        area_std  = grp_area.transform('std').fillna(0)
+        df['area_cv'] = area_std / (area_mean + 1e-6)
+    return df
+
+
+def calculate_postural_states(df,
+                               frame_rate=10,
+                               direction_threshold=np.pi * 2 / 3,
+                               speed_threshold=0.5,
+                               min_run_length=10,
+                               reversal_persistence=2,
+                               pirouette_speed_threshold=0.3,
+                               pirouette_eccentricity_threshold=0.8,
+                               min_pirouette_duration=2,
+                               area_reliability_threshold=0.70,
+                               merge_reversal_gap=5):
+    """Phase 2 (postural mode): add reversal/pirouette/movement_type columns.
+    Requires df to have already been through calculate_speed_parameters().
+
+    Reversal detection uses a stable long-window reference direction (2 * frame_rate frames)
+    rather than the short window_size rolling mean. The short rolling mean catches up to the
+    reversal direction within window_size frames, making ongoing reversals invisible and
+    falsely detecting the return-to-forward as a new large angle event. The long window stays
+    pointing forward throughout a typical short reversal, giving correct onset detection and
+    avoiding false detection of the post-reversal turn.
+
+    Reversal exit: the backward heading is stored at entry; exit fires when current
+    movement_angle differs by > π/2 from that stored heading (worm has turned away from
+    its reversal direction), or on speed drop, or after 3-second timeout.
+
+    Area reliability gate (area_reliability_threshold): frames where the segmented area
+    drops below this fraction of the particle's median area are flagged unreliable.
+    Reversal entry is blocked on unreliable frames (partial body thresholding or worm
+    partially out of frame give jittery centroids that look like direction reversals).
+
+    Merge gap (merge_reversal_gap): after detection, adjacent reversal events on the same
+    particle separated by ≤ this many frames are merged into one. This repairs splits
+    caused by brief unreliable frames mid-reversal, ensuring a single behavioural event
+    is not double-counted.
+    """
+    df = df.copy()
+    max_reversal_frames = int(3 * frame_rate)
+    stable_window = int(2 * frame_rate)  # long enough to resist shifting during a short reversal
+
+    # Long-window reference direction for reversal onset detection.
+    # Uses a backward-looking rolling window so it represents where the worm was heading
+    # before any potential reversal started. The short window_size mean catches up within
+    # a few frames; this one stays pointing forward for the full duration of a short reversal.
+    df['_ma_filled'] = df['movement_angle'].fillna(0)
+    df['_ma_sin'] = np.sin(df['_ma_filled'])
+    df['_ma_cos'] = np.cos(df['_ma_filled'])
+    df['_stable_sin'] = (df.groupby('particle')['_ma_sin']
+                         .transform(lambda x: x.rolling(stable_window, min_periods=1).mean()))
+    df['_stable_cos'] = (df.groupby('particle')['_ma_cos']
+                         .transform(lambda x: x.rolling(stable_window, min_periods=1).mean()))
+    stable_angle = np.arctan2(df['_stable_sin'], df['_stable_cos'])
+    raw_diff = df['_ma_filled'] - stable_angle
+    df['_angle_from_stable'] = ((raw_diff + np.pi) % (2 * np.pi) - np.pi).abs()
+    df.drop(columns=['_ma_filled', '_ma_sin', '_ma_cos', '_stable_sin', '_stable_cos'],
+            inplace=True)
+
+    # ========== PIROUETTE FRAME PRE-DETECTION ==========
+    # Compute pirouette-frame flag before the reversal loop so omega-turn frames can be
+    # excluded from reversal entry. An omega turn (low eccentricity + low speed) should
+    # never be mislabeled as a reversal even if the CoM moves in an off-axis direction.
+    df['is_pirouette_frame'] = (
+        (df['eccentricity'] < pirouette_eccentricity_threshold) &
+        (df['speed'] < pirouette_speed_threshold)
     )
-    
-   # Mark reversal periods: from reversal_start until the next direction_change
-    # During reversal, speed should be about half of forward run
+
+    # ========== AREA RELIABILITY FLAG ==========
+    # Frames where area falls below area_reliability_threshold * per-particle median are
+    # unreliable: partial body thresholding (edge illumination) or worm partially out of
+    # frame cause centroid jitter that mimics a direction reversal. Block entry on these.
+    median_area = df.groupby('particle')['area'].transform('median')
+    df['_reliable_area'] = df['area'] >= area_reliability_threshold * median_area
+
+    # ========== REVERSAL DETECTION ==========
     df['is_reversal'] = False
-    df['reversal_id'] = 0  # Track which reversal event
-    
+    df['reversal_id'] = 0
+
     for particle in df['particle'].unique():
         mask = df['particle'] == particle
-        particle_df = df.loc[mask].copy()
-        
+        particle_df = df.loc[mask]
+
+        angles = particle_df['_angle_from_stable'].values
+        speeds = particle_df['speed'].values
+        movement_angles = particle_df['movement_angle'].fillna(0).values
+        is_pir_frame = particle_df['is_pirouette_frame'].values
+        reliable_area = particle_df['_reliable_area'].values
+        n = len(particle_df)
+
+        # Rolling max speed over the half-second immediately preceding each frame
+        # (not including the current frame). Reversal entry requires that the worm
+        # was actively locomoting in this window: worms that have been paused for
+        # ≥ 0.5 s cannot initiate a reversal, so this gate blocks angle-noise
+        # false positives during genuine pauses.
+        entry_lookback = max(int(0.5 * frame_rate), reversal_persistence + 1)
+        recent_max_speed = np.array([
+            speeds[max(0, i - entry_lookback):i].max() if i > 0 else 0.0
+            for i in range(n)
+        ])
+
+        is_rev = np.zeros(n, dtype=bool)
+        rev_id = np.zeros(n, dtype=int)
+
         in_reversal = False
         reversal_counter = 0
-        reversal_start_frame = 0
-        is_reversal_list = []
-        reversal_id_list = []
-        
-        for i, (rev_start, dir_change, spd) in enumerate(zip(particle_df['reversal_start'], 
-                                              particle_df['direction_change_event'],
-                                              particle_df['speed'])):
-            if rev_start:
-                # Start of a reversal
-                in_reversal = True
-                reversal_counter += 1
-                reversal_start_frame = i
-                is_reversal_list.append(True)
-                reversal_id_list.append(reversal_counter)
-            elif in_reversal and dir_change:
-                # End of reversal (another direction change = start of new forward run)
-                in_reversal = False
-                is_reversal_list.append(False)
-                reversal_id_list.append(0)
-            elif in_reversal and (i - reversal_start_frame) >= 3*frame_rate: # 3 seconds max
-                # Reversal has gone on too long - likely a mis-annotation
-                # End the reversal
-                in_reversal = False
-                is_reversal_list.append(False)
-                reversal_id_list.append(0)
-            elif in_reversal and spd > speed_threshold * 0.4:
-                # Still in reversal (speed is about half of forward run)
-                is_reversal_list.append(True)
-                reversal_id_list.append(reversal_counter)
-            elif in_reversal:
-                # Speed dropped too low - probably stopped or pirouetting
-                # End the reversal
-                in_reversal = False
-                is_reversal_list.append(False)
-                reversal_id_list.append(0)
+        reversal_start_i = 0
+        reversal_angle = 0.0  # movement direction at reversal entry (backward heading)
+        pending = 0            # consecutive qualifying frames
+
+        for i in range(n):
+            # Entry: large angle from stable mean + not in an omega turn + reliable area.
+            # Speed is NOT required at entry because a reversal always begins with deceleration
+            # through near-zero speed; requiring speed > threshold would consistently delay
+            # onset detection by 1-2 frames. The angle_from_stable signal plus pirouette
+            # exclusion are sufficient to gate entry correctly.
+            # Unreliable-area frames are excluded to prevent centroid jitter from partial
+            # body thresholding (edge of plate, variable illumination) from triggering entry.
+            above = (angles[i] > direction_threshold
+                     and not is_pir_frame[i]
+                     and reliable_area[i]
+                     and recent_max_speed[i] > speed_threshold)
+
+            if not in_reversal:
+                if above:
+                    pending += 1
+                    if pending >= reversal_persistence:
+                        in_reversal = True
+                        reversal_counter += 1
+                        reversal_start_i = i - reversal_persistence + 1
+                        reversal_angle = movement_angles[i]
+                        is_rev[reversal_start_i:i + 1] = True
+                        rev_id[reversal_start_i:i + 1] = reversal_counter
+                else:
+                    pending = 0
             else:
-                # Not in reversal
-                is_reversal_list.append(False)
-                reversal_id_list.append(0)
+                # Exit when worm is no longer heading in the reversal direction.
+                # Compare current movement angle to the stored backward heading at entry;
+                # diff > π/2 means the worm has turned more than 90° away from backward.
+                diff = movement_angles[i] - reversal_angle
+                diff = (diff + np.pi) % (2 * np.pi) - np.pi  # wrap to [-π, π]
+                no_longer_backward = abs(diff) > np.pi / 2
 
-        df.loc[mask, 'is_reversal'] = is_reversal_list
-        df.loc[mask, 'reversal_id'] = reversal_id_list
-    
-    # Also track reversal end explicitly
-    prev_reversal = df.groupby('particle')['is_reversal'].shift(1)
-    df['reversal_end'] = (prev_reversal == True) & ~df['is_reversal']
+                if (no_longer_backward
+                        or speeds[i] < speed_threshold * 0.3
+                        or (i - reversal_start_i) >= max_reversal_frames):
+                    in_reversal = False
+                    pending = 0
+                else:
+                    is_rev[i] = True
+                    rev_id[i] = reversal_counter
 
-    
-    # ========== PIROUETTE DETECTION ==========
-    df['is_pirouette_frame'] = (
-        (df['speed'] < pirouette_speed_threshold) &
-        (df['eccentricity'] < pirouette_eccentricity_threshold)
-    )
-    
-    # Count consecutive pirouette frames
+        df.loc[mask, 'is_reversal'] = is_rev
+        df.loc[mask, 'reversal_id'] = rev_id
+
+    # ========== MERGE ADJACENT REVERSALS ==========
+    # Brief unreliable frames mid-reversal (area drop, out-of-frame) can cause the exit
+    # condition to fire and re-entry to follow, splitting one behavioural reversal into two
+    # events. Merge pairs of reversal events on the same particle that are separated by
+    # ≤ merge_reversal_gap frames so they are counted as a single reversal.
+    if merge_reversal_gap > 0:
+        for particle in df['particle'].unique():
+            mask = df['particle'] == particle
+            particle_df = df.loc[mask]
+            is_rev = particle_df['is_reversal'].values.copy()
+            rev_id = particle_df['reversal_id'].values.copy()
+            n = len(is_rev)
+
+            # Locate starts and ends of reversal runs (local indices within particle)
+            padded = np.concatenate([[False], is_rev, [False]])
+            starts = np.where(np.diff(padded.astype(int)) == 1)[0]
+            ends   = np.where(np.diff(padded.astype(int)) == -1)[0]  # first non-reversal index
+
+            for k in range(len(starts) - 1):
+                gap = starts[k + 1] - ends[k]  # frames between end of event k and start of k+1
+                if gap <= merge_reversal_gap:
+                    # Fill gap frames with reversal; keep the earlier reversal_id
+                    is_rev[ends[k]:starts[k + 1]] = True
+                    rev_id[ends[k]:starts[k + 1]] = rev_id[ends[k] - 1]
+
+            df.loc[mask, 'is_reversal'] = is_rev
+            df.loc[mask, 'reversal_id'] = rev_id
+
+    df.drop(columns=['_reliable_area'], inplace=True)
+
+    prev_rev = df.groupby('particle')['is_reversal'].shift(1).fillna(False).infer_objects(copy=False)
+    df['reversal_start'] = df['is_reversal'] & ~prev_rev
+    df['reversal_end'] = ~df['is_reversal'] & prev_rev
+
+    # ========== PIROUETTE DETECTION (full labeling) ==========
+    # is_pirouette_frame was already computed above; now add duration and sustained flag.
     df['pirouette_duration'] = (df.groupby('particle')['is_pirouette_frame']
-                                .transform(count_consecutive_true))
-    
-    # Mark as pirouette only if duration exceeds minimum
+                                 .transform(_count_consecutive_true))
     df['is_pirouette'] = df['pirouette_duration'] >= min_pirouette_duration
-    
-    # Detect pirouette start (first frame of a pirouette event)
+
     prev_pirouette = df.groupby('particle')['is_pirouette'].shift(1)
     df['pirouette_start'] = df['is_pirouette'] & (prev_pirouette != True)
-    
-    # Classify pirouette type based on what preceded it
     df['pirouette_type'] = None
-    
-    # Check if pirouette follows a reversal (within N frames)
+
+    # Classify pirouette type: preceded by a reversal within 5 frames = post_reversal
     frames_after_reversal_threshold = 5
     df['recent_reversal'] = (
         df.groupby('particle')['reversal_start']
         .transform(lambda x: x.rolling(frames_after_reversal_threshold, min_periods=1).sum() > 0)
     )
-    
-    # Classify pirouette types
     df.loc[df['pirouette_start'] & df['recent_reversal'], 'pirouette_type'] = 'post_reversal'
     df.loc[df['pirouette_start'] & ~df['recent_reversal'], 'pirouette_type'] = 'spontaneous'
-    
-    # Forward fill pirouette type for duration of pirouette
+
     for particle in df['particle'].unique():
         mask = df['particle'] == particle
         particle_df = df.loc[mask].copy()
-        
         current_type = None
         pirouette_types = []
-        
         for is_pir, pir_type in zip(particle_df['is_pirouette'], particle_df['pirouette_type']):
-            if pir_type is not None:  # Start of new pirouette
+            if pir_type is not None:
                 current_type = pir_type
-            
-            if is_pir:
-                pirouette_types.append(current_type)
-            else:
-                pirouette_types.append(None)
-                current_type = None
-        
-        df.loc[mask, 'pirouette_type'] = pirouette_types   
+            pirouette_types.append(current_type if is_pir else None)
+        df.loc[mask, 'pirouette_type'] = pirouette_types
 
-    
     # ========== CLASSIFY MOVEMENT TYPE ==========
-    # Priority: pirouette > reversal > forward_run > short_run > meandering > stationary
     df['movement_type'] = 'stationary'
     df.loc[df['is_moving'] & ~df['is_directionally_stable'], 'movement_type'] = 'meandering'
     df.loc[df['is_directionally_stable'] & (df['stable_run_counter'] < min_run_length), 'movement_type'] = 'short_run'
     df.loc[df['is_directionally_stable'] & (df['stable_run_counter'] >= min_run_length), 'movement_type'] = 'forward_run'
     df.loc[df['is_reversal'], 'movement_type'] = 'reversal'
     df.loc[df['is_pirouette'], 'movement_type'] = 'pirouette'
-    
-    # Count frames since last reversal
+
     df['frames_since_reversal'] = 0
     for particle in df['particle'].unique():
         mask = df['particle'] == particle
         particle_df = df.loc[mask].copy()
-        
         frames_since = 0
         frames_list = []
-        
-        for is_rev in particle_df['reversal_start']:
-            if is_rev:
-                frames_since = 0
-            else:
-                frames_since += 1
+        for is_rev_start in particle_df['reversal_start']:
+            frames_since = 0 if is_rev_start else frames_since + 1
             frames_list.append(frames_since)
-        
         df.loc[mask, 'frames_since_reversal'] = frames_list
-    
-    # Count frames since last pirouette
+
     df['frames_since_pirouette'] = 0
     for particle in df['particle'].unique():
         mask = df['particle'] == particle
         particle_df = df.loc[mask].copy()
-        
         frames_since = 0
         frames_list = []
-        
         for is_pir_start in particle_df['pirouette_start']:
-            if is_pir_start:
-                frames_since = 0
-            else:
-                frames_since += 1
+            frames_since = 0 if is_pir_start else frames_since + 1
             frames_list.append(frames_since)
-        
         df.loc[mask, 'frames_since_pirouette'] = frames_list
-    
+
+    df.drop(columns=['_angle_from_stable'], inplace=True)
     return df
+
+
+def calculate_motion_parameters(df,
+                                pixel_length=60,           # pixels/mm
+                                frame_rate=10,             # frames/sec
+                                window_size=7,
+                                direction_threshold=np.pi * 2 / 3,
+                                speed_threshold=0.5,       # mm/s
+                                min_run_length=10,
+                                reversal_persistence=2,
+                                smooth_window=5,
+                                min_displacement_for_angle=1.5,  # mm
+                                pirouette_speed_threshold=0.3,   # mm/s
+                                pirouette_eccentricity_threshold=0.8,
+                                min_pirouette_duration=2,
+                                max_instantaneous_speed=5.0,     # mm/s
+                                stability_threshold=0.90):
+    """Convenience wrapper: calculate_speed_parameters() then calculate_postural_states()."""
+    df = calculate_speed_parameters(
+        df,
+        pixel_length=pixel_length,
+        frame_rate=frame_rate,
+        window_size=window_size,
+        speed_threshold=speed_threshold,
+        smooth_window=smooth_window,
+        min_displacement_for_angle=min_displacement_for_angle,
+        max_instantaneous_speed=max_instantaneous_speed,
+        stability_threshold=stability_threshold,
+    )
+    return calculate_postural_states(
+        df,
+        frame_rate=frame_rate,
+        direction_threshold=direction_threshold,
+        speed_threshold=speed_threshold,
+        min_run_length=min_run_length,
+        reversal_persistence=reversal_persistence,
+        pirouette_speed_threshold=pirouette_speed_threshold,
+        pirouette_eccentricity_threshold=pirouette_eccentricity_threshold,
+        min_pirouette_duration=min_pirouette_duration,
+    )
 
 # Example usage and interpretation
 def classify_movement(row):
@@ -1020,10 +1096,11 @@ def classify_movement(row):
     else:
         return 'backward'
 
-def create_annotated_video(video_path, df, particle_id, output_folder, 
+def create_annotated_video(video_path, df, particle_id, output_folder,
                            pixel_length=60, frame_rate=10,
                            global_thresh=None, min_area=100, max_area=5000,
-                           illumination=0, crop_size=150, show_mask=True):
+                           illumination=0, crop_size=300, source_crop_px=100,
+                           show_mask=True):
     """
     Create a video of a single particle with movement type annotations.
     
@@ -1058,6 +1135,7 @@ def create_annotated_video(video_path, df, particle_id, output_folder,
     # Get data for this particle
     particle_df = df[df['particle'] == particle_id].copy()
     particle_df = particle_df.sort_values('frame')
+    particle_median_area = particle_df['area'].median() if 'area' in particle_df.columns else None
     
     if len(particle_df) == 0:
         print(f"No data found for particle {particle_id}")
@@ -1124,161 +1202,126 @@ def create_annotated_video(video_path, df, particle_id, output_folder,
     
     frame_idx = start_frame
     prev_movement_type = None
-    
+    # Persistent state — hold last known values so gap frames don't go black
+    x, y = width // 2, height // 2
+    color = (128, 128, 128)
+    movement_type = 'stationary'
+    row = None
+
     while frame_idx <= end_frame:
         ret, frame = cap.read()
         if not ret:
             break
-        
-        # Convert to grayscale for processing
+
         if len(frame.shape) == 3:
             gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         else:
             gray_frame = frame.copy()
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        
-        # Create output canvas
+
         canvas = np.zeros((output_height, output_width, 3), dtype=np.uint8)
         canvas[:height, :width] = frame
-        
-        # Get data for current frame
+
         frame_data = particle_df[particle_df['frame'] == frame_idx]
-        
+
         if len(frame_data) > 0:
             row = frame_data.iloc[0]
-            
-            # Get position
             x = int(row['x'])
             y = int(row['y'])
-            
-            # Get movement type
             movement_type = row['movement_type']
             color = colors.get(movement_type, (255, 255, 255))
-            
-            # Segment the frame to find this particle using preprocess_frame
+
+            # Segment and apply mask overlay when object is detected near centroid
             _, props, _ = preprocess_frame(gray_frame,
                                            min_area=min_area,
                                            max_area=max_area,
                                            thresh=global_thresh,
                                            illumination=illumination)
-            
-            # Find the region closest to the tracked centroid
             best_prop = None
             min_dist = float('inf')
             for prop in props:
                 prop_y, prop_x = prop.centroid
                 dist = np.sqrt((prop_x - x)**2 + (prop_y - y)**2)
+                # Reject objects whose area is outside 50–175 % of this particle's
+                # median area so a nearby worm cannot steal the highlight.
+                if particle_median_area is not None:
+                    if not (0.50 * particle_median_area <= prop.area <= 1.75 * particle_median_area):
+                        continue
                 if dist < min_dist:
                     min_dist = dist
                     best_prop = prop
-            
-            if best_prop is not None and min_dist < 20:  # Within 20 pixels
-                # Draw mask overlay on main view
+
+            if best_prop is not None and min_dist < 25:
                 if show_mask:
-                    # Create colored mask using the returned mask from preprocess_frame
                     colored_mask = np.zeros_like(frame)
-                    # Get this specific object's mask
                     object_mask = np.zeros((height, width), dtype=bool)
                     object_mask[best_prop.slice][best_prop.image] = True
                     colored_mask[object_mask] = color
-                    
-                    # Blend with original
                     canvas[:height, :width] = cv2.addWeighted(frame, 0.7, colored_mask, 0.3, 0)
-                
-                # Draw bounding box on main view
-                minr, minc, maxr, maxc = best_prop.bbox
-                cv2.rectangle(canvas, (minc, minr), (maxc, maxr), color, 2)
-                
-                # Draw orientation arrow
-                if 'orientation' in row:
-                    orientation = row['orientation']
-                    arrow_length = 40
-                    end_x = int(x + arrow_length * np.sin(orientation))
-                    end_y = int(y + arrow_length * np.cos(orientation))
-                    cv2.arrowedLine(canvas, (x, y), (end_x, end_y), color, 3, tipLength=0.3)
-                
-                # Create cropped view
-                half_crop = crop_size // 2
-                x_start = max(0, x - half_crop)
-                x_end = min(width, x + half_crop)
-                y_start = max(0, y - half_crop)
-                y_end = min(height, y + half_crop)
-                
-                # Extract crop from blended image
-                crop = canvas[y_start:y_end, x_start:x_end].copy()
-                
-                # Resize to fixed size if needed
-                if crop.shape[0] > 0 and crop.shape[1] > 0:
-                    crop_resized = cv2.resize(crop, (crop_size, crop_size))
-                    
-                    # Add border
-                    crop_bordered = cv2.copyMakeBorder(crop_resized, 3, 3, 3, 3, 
-                                                       cv2.BORDER_CONSTANT, value=color)
-                    
-                    # Place in canvas
-                    canvas[10:10+crop_size+6, width+10:width+10+crop_size+6] = crop_bordered
-                
-                # Draw crosshair on main view
-                cv2.drawMarker(canvas, (x, y), color, cv2.MARKER_CROSS, 15, 2)
-            
-            # Draw trajectory (past 60 frames)
+
+            # Transition label
+            if prev_movement_type is not None and movement_type != prev_movement_type:
+                transition_text = f"{prev_movement_type} -> {movement_type}"
+                cv2.putText(canvas, "TRANSITION!", (width + 10, crop_size + 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.putText(canvas, transition_text, (width + 10, crop_size + 70),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            prev_movement_type = movement_type
+
+        # ── Crop inset from mask-only canvas (before trajectory is drawn) ────
+        x_start = max(0, x - source_crop_px)
+        x_end   = min(width,  x + source_crop_px)
+        y_start = max(0, y - source_crop_px)
+        y_end   = min(height, y + source_crop_px)
+        crop = canvas[y_start:y_end, x_start:x_end].copy()
+
+        # ── Trajectory on main view only (past 60 frames) ────────────────────
+        if row is not None:
             past_frames = particle_df[
-                (particle_df['frame'] <= frame_idx) & 
+                (particle_df['frame'] <= frame_idx) &
                 (particle_df['frame'] > frame_idx - 60)
             ]
             if len(past_frames) > 1:
                 points = np.array([[int(r['x']), int(r['y'])] for _, r in past_frames.iterrows()])
                 cv2.polylines(canvas[:height, :width], [points], False, color, 2)
-            
-            # Detect movement type transitions
-            if prev_movement_type is not None and movement_type != prev_movement_type:
-                transition_text = f"{prev_movement_type} -> {movement_type}"
-                cv2.putText(canvas, "TRANSITION!", (width + 10, crop_size + 40), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                cv2.putText(canvas, transition_text, (width + 10, crop_size + 70), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            
-            prev_movement_type = movement_type
-            
-            # Add text overlay with current state (on right side)
-            info_x = width + 10
-            info_y_start = crop_size + 100
-            
-            cv2.putText(canvas, f"Particle: {particle_id}", (info_x, info_y_start), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(canvas, f"Frame: {frame_idx}", (info_x, info_y_start + 25), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(canvas, f"Type:", (info_x, info_y_start + 50), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.putText(canvas, f"{movement_type}", (info_x, info_y_start + 75), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            
-            # Add speed if available
+        if crop.shape[0] > 0 and crop.shape[1] > 0:
+            crop_resized = cv2.resize(crop, (crop_size, crop_size))
+            crop_bordered = cv2.copyMakeBorder(crop_resized, 3, 3, 3, 3,
+                                               cv2.BORDER_CONSTANT, value=color)
+            canvas[10:10+crop_size+6, width+10:width+10+crop_size+6] = crop_bordered
+
+        info_x = width + 10
+        info_y_start = crop_size + 100
+        cv2.putText(canvas, f"Particle: {particle_id}", (info_x, info_y_start),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(canvas, f"Frame: {frame_idx}", (info_x, info_y_start + 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(canvas, f"Type:", (info_x, info_y_start + 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(canvas, f"{movement_type}", (info_x, info_y_start + 75),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        if row is not None:
             if 'speed' in row:
-                speed_text = f"Speed: {row['speed']:.2f} mm/s"
-                cv2.putText(canvas, speed_text, (info_x, info_y_start + 100), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            
-            # Add eccentricity for pirouettes
+                cv2.putText(canvas, f"Speed: {row['speed']:.2f} mm/s",
+                            (info_x, info_y_start + 100),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
             if 'eccentricity' in row:
-                ecc_text = f"Ecc: {row['eccentricity']:.2f}"
-                cv2.putText(canvas, ecc_text, (info_x, info_y_start + 125), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            
-            # Add legend at bottom
-            legend_y = output_height - 160
-            cv2.putText(canvas, "Legend:", (10, legend_y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            for i, (mt, col) in enumerate(colors.items()):
-                y_pos = legend_y + 20 + i * 20
-                cv2.rectangle(canvas, (10, y_pos - 12), (30, y_pos), col, -1)
-                cv2.putText(canvas, mt, (35, y_pos), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        
+                cv2.putText(canvas, f"Ecc: {row['eccentricity']:.2f}",
+                            (info_x, info_y_start + 125),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+        legend_y = output_height - 160
+        cv2.putText(canvas, "Legend:", (10, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        for i, (mt, col) in enumerate(colors.items()):
+            y_pos = legend_y + 20 + i * 20
+            cv2.rectangle(canvas, (10, y_pos - 12), (30, y_pos), col, -1)
+            cv2.putText(canvas, mt, (35, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
         out.write(canvas)
         frame_idx += 1
-        
-        # Progress indicator
+
         if frame_idx % 10 == 0:
             print(f"\rProcessing frame {frame_idx}/{end_frame}", end="", flush=True)
     
